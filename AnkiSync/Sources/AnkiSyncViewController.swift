@@ -1,0 +1,510 @@
+import Foundation
+import UIKit
+import WebKit
+import UniformTypeIdentifiers
+import CryptoKit
+
+/// Native file bridge for AnkiSync. All card/study UI remains the original HTML.
+/// Native writes require a verified local recovery archive and SHA-256 conflict checks.
+final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
+                                    UIDocumentPickerDelegate, WKNavigationDelegate, WKUIDelegate {
+    private var webView: WKWebView!
+    private let bookmarkKey = "AnkiSync.iCloudFolderBookmark.v1"
+    private var pendingPickerID: String?
+    private let maxFileBytes = 512 * 1024 * 1024
+    private let chunkLength = 96 * 1024 // smaller messages keep WKWebView responsive
+    private let linkStorageKey = "AnkiSync.NativeFileLinks.v1"
+    private struct PendingWrite {
+        let deckId: String
+        let path: String
+        let expectedHash: String
+        let declaredSize: Int
+        var bytes = Data()
+    }
+    private var pendingWrites: [String: PendingWrite] = [:]
+
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = UIColor(red: 15/255, green: 23/255, blue: 42/255, alpha: 1)
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = WKWebsiteDataStore.default()
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.userContentController.add(self, name: "AnkiNativeBridge")
+        webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.isOpaque = false
+        webView.backgroundColor = view.backgroundColor
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(webView)
+        NSLayoutConstraint.activate([
+            webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            webView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            webView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
+        ])
+        guard let html = Bundle.main.url(forResource: "AnkiSync", withExtension: "html") else {
+            showError("The bundled AnkiSync HTML was not found.")
+            return
+        }
+        webView.loadFileURL(html, allowingReadAccessTo: html.deletingLastPathComponent())
+    }
+
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard message.name == "AnkiNativeBridge",
+              let obj = message.body as? [String: Any],
+              let id = obj["id"] as? String,
+              let action = obj["action"] as? String else { return }
+        switch action {
+        case "chooseFolder":
+            if pendingPickerID != nil {
+                reply(id, error: "A folder picker is already open.")
+                return
+            }
+            pendingPickerID = id
+            let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
+            picker.allowsMultipleSelection = false
+            picker.delegate = self
+            present(picker, animated: true)
+        case "status":
+            let folder = bookmarkedFolder()
+            let permitted = folder?.startAccessingSecurityScopedResource() ?? false
+            if permitted { folder?.stopAccessingSecurityScopedResource() }
+            reply(id, data: ["connected": permitted,
+                             "folder": permitted ? (folder?.lastPathComponent ?? "") : "",
+                             "links": permitted ? loadLinks() : [:]])
+        case "listFiles":
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                do {
+                    let names = try self.listDeckFiles()
+                    DispatchQueue.main.async { self.reply(id, data: names) }
+                } catch {
+                    DispatchQueue.main.async { self.reply(id, error: error.localizedDescription) }
+                }
+            }
+        case "readFile":
+            guard let name = obj["path"] as? String else {
+                reply(id, error: "Missing source filename.")
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                do {
+                    let result = try self.readDeck(path: name)
+                    DispatchQueue.main.async { self.transferFile(id: id, name: result.0, data: result.1) }
+                } catch {
+                    DispatchQueue.main.async { self.reply(id, error: error.localizedDescription) }
+                }
+            }
+        case "linkFile":
+            guard let deckId = obj["deckId"] as? String, !deckId.isEmpty,
+                  let path = obj["path"] as? String else {
+                reply(id, error: "A deck and its original path are required.")
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                do {
+                    let result = try self.linkFile(deckId: deckId, path: path)
+                    DispatchQueue.main.async { self.reply(id, data: result) }
+                } catch {
+                    DispatchQueue.main.async { self.reply(id, error: error.localizedDescription) }
+                }
+            }
+        case "exportRecovery":
+            guard let deckId = obj["deckId"] as? String,
+                  let record = loadLinks()[deckId],
+                  let expectedHash = record["recoveryHash"],
+                  let backupName = record["backup"],
+                  let sourceName = record["name"] else {
+                reply(id, error: "There is no linked recovery backup to export.")
+                return
+            }
+            do {
+                let url = try recoveryURL(deckId: deckId,
+                    hash: expectedHash, sourceName: sourceName)
+                guard url.lastPathComponent == backupName,
+                      let bytes = try? Data(contentsOf: url),
+                      hash(bytes) == expectedHash else {
+                    throw NativeError("The recovery copy is missing or its checksum is incorrect.")
+                }
+                let share = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+                if let popover = share.popoverPresentationController {
+                    popover.sourceView = webView
+                    popover.sourceRect = CGRect(x: webView.bounds.midX,
+                                               y: webView.bounds.midY, width: 1, height: 1)
+                }
+                present(share, animated: true)
+                reply(id, data: ["backup":backupName, "verified":true])
+            } catch {
+                reply(id, error: error.localizedDescription)
+            }
+        case "unlinkFile":
+            guard let deckId = obj["deckId"] as? String else {
+                reply(id, error: "Missing deck ID.")
+                return
+            }
+            var links = loadLinks()
+            links.removeValue(forKey: deckId)
+            saveLinks(links)
+            reply(id, data: ["unlinked": true])
+        case "setPaused":
+            guard let deckId = obj["deckId"] as? String,
+                  let paused = obj["paused"] as? Bool else {
+                reply(id, error: "Missing pause state.")
+                return
+            }
+            var links = loadLinks()
+            guard links[deckId] != nil else {
+                reply(id, error: "Deck has no native file link.")
+                return
+            }
+            links[deckId]?["paused"] = paused ? "1" : "0"
+            saveLinks(links)
+            reply(id, data: ["paused": paused])
+        case "beginWrite":
+            guard let deckId = obj["deckId"] as? String,
+                  let path = obj["path"] as? String,
+                  let expectedHash = obj["expectedHash"] as? String,
+                  let transferId = obj["transferId"] as? String,
+                  let size = obj["size"] as? Int,
+                  (100...maxFileBytes).contains(size),
+                  pendingWrites[transferId] == nil,
+                  loadLinks()[deckId]?["path"] == path else {
+                reply(id, error: "Invalid or unlinked write request. Original not modified.")
+                return
+            }
+            pendingWrites[transferId] = PendingWrite(deckId: deckId,
+                path: path, expectedHash: expectedHash, declaredSize: size)
+            reply(id, data: ["ready": true])
+        case "writeChunk":
+            guard let transferId = obj["transferId"] as? String,
+                  let encoded = obj["data"] as? String,
+                  let data = Data(base64Encoded: encoded),
+                  var transfer = pendingWrites[transferId],
+                  data.count <= chunkLength * 2,
+                  transfer.bytes.count + data.count <= transfer.declaredSize else {
+                reply(id, error: "Invalid data chunk. Original not modified.")
+                return
+            }
+            transfer.bytes.append(data)
+            pendingWrites[transferId] = transfer
+            reply(id, data: ["received": transfer.bytes.count])
+        case "abortWrite":
+            if let transferId = obj["transferId"] as? String { pendingWrites.removeValue(forKey: transferId) }
+            reply(id, data: ["aborted": true])
+        case "completeWrite":
+            guard let transferId = obj["transferId"] as? String,
+                  let transfer = pendingWrites.removeValue(forKey: transferId),
+                  transfer.bytes.count == transfer.declaredSize else {
+                reply(id, error: "Incomplete file transfer. Original not modified.")
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                do {
+                    let result = try self.writeLinkedFile(transfer)
+                    DispatchQueue.main.async { self.reply(id, data: result) }
+                } catch {
+                    DispatchQueue.main.async { self.reply(id, error: error.localizedDescription) }
+                }
+            }
+        default:
+            reply(id, error: "Unsupported native action.")
+        }
+    }
+
+    // Without WKUIDelegate, WKWebView silently ignores JS confirm()/prompt().
+    // This broke Delete, hard resets, selecting iCloud files, and other controls.
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+        let alert = UIAlertController(title: "AnkiSync", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler() })
+        present(alert, animated: true)
+    }
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+        let alert = UIAlertController(title: "AnkiSync", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(false) })
+        alert.addAction(UIAlertAction(title: "Confirm", style: .default) { _ in completionHandler(true) })
+        present(alert, animated: true)
+    }
+    func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String,
+                 defaultText: String?, initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping (String?) -> Void) {
+        let alert = UIAlertController(title: "AnkiSync", message: prompt, preferredStyle: .alert)
+        alert.addTextField { field in field.text = defaultText }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(nil) })
+        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+            completionHandler(alert.textFields?.first?.text)
+        })
+        present(alert, animated: true)
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        if let id = pendingPickerID { reply(id, error: "Cancelled") }
+        pendingPickerID = nil
+    }
+
+    func documentPicker(_ controller: UIDocumentPickerViewController,
+                        didPickDocumentsAt urls: [URL]) {
+        guard let id = pendingPickerID else { return }
+        pendingPickerID = nil
+        guard let selected = urls.first else { reply(id, error: "No folder selected."); return }
+        let previous = bookmarkedFolder()
+        let accessed = selected.startAccessingSecurityScopedResource()
+        defer { if accessed { selected.stopAccessingSecurityScopedResource() } }
+        do {
+            let bookmark = try selected.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+            UserDefaults.standard.set(bookmark, forKey: bookmarkKey)
+            if previous?.standardizedFileURL != selected.standardizedFileURL {
+                // Never keep a writable deck link when the authorized folder changes.
+                saveLinks([:])
+            }
+            reply(id, data: ["folder": selected.lastPathComponent])
+        } catch {
+            reply(id, error: "Could not remember this folder: " + error.localizedDescription)
+        }
+    }
+
+    private func bookmarkedFolder() -> URL? {
+        guard let data = UserDefaults.standard.data(forKey: bookmarkKey) else { return nil }
+        var stale = false
+        do {
+            let url = try URL(resolvingBookmarkData: data, options: [], relativeTo: nil,
+                              bookmarkDataIsStale: &stale)
+            if stale, let replacement = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
+                UserDefaults.standard.set(replacement, forKey: bookmarkKey)
+            }
+            return url
+        } catch { return nil }
+    }
+
+    private func withFolder<T>(_ block: (URL) throws -> T) throws -> T {
+        guard let folder = bookmarkedFolder() else {
+            throw NativeError("Tap 'Connect iCloud Anki' and authorize your Anki folder once.")
+        }
+        guard folder.startAccessingSecurityScopedResource() else {
+            throw NativeError("Saved iCloud folder permission expired. Tap 'Connect iCloud Anki' to authorize it again.")
+        }
+        defer { folder.stopAccessingSecurityScopedResource() }
+        return try block(folder)
+    }
+
+    private func checkedPath(_ relative: String, under folder: URL) throws -> URL {
+        let path = relative.replacingOccurrences(of: "\\", with: "/")
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard !path.hasPrefix("/"), !parts.isEmpty,
+              parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }),
+              ["apkg", "colpkg"].contains(String(parts.last!).split(separator: ".").last?.lowercased() ?? "") else {
+            throw NativeError("Only files inside the authorized folder ending in .apkg or .colpkg are supported.")
+        }
+        let root = folder.standardizedFileURL
+        let target = parts.reduce(root) { $0.appendingPathComponent(String($1)) }.standardizedFileURL
+        guard target.path.hasPrefix(root.path + "/") else { throw NativeError("Invalid deck file location.") }
+        return target
+    }
+
+    private func readDeck(path: String) throws -> (String, Data) {
+        try withFolder { folder in
+            let requested = try checkedPath(path, under: folder)
+            var coordinatorError: NSError?
+            var result: Data?
+            var readError: Error?
+            let coordinator = NSFileCoordinator(filePresenter: nil)
+            coordinator.coordinate(readingItemAt: requested, options: [], error: &coordinatorError) { url in
+                do {
+                    let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                    guard size <= self.maxFileBytes else { throw NativeError("This APKG exceeds the current 512 MB transfer limit.") }
+                    result = try Data(contentsOf: url)
+                } catch { readError = error }
+            }
+            if let error = readError { throw error }
+            if let error = coordinatorError { throw error }
+            guard let data = result else { throw NativeError("The iCloud file could not be downloaded or opened.") }
+            guard data.count <= maxFileBytes else { throw NativeError("This APKG exceeds the current 512 MB transfer limit.") }
+            return (requested.lastPathComponent, data)
+        }
+    }
+
+    private func listDeckFiles() throws -> [String] {
+        try withFolder { folder in
+            var coordinatorError: NSError?
+            var names: [String] = []
+            let coordinator = NSFileCoordinator(filePresenter: nil)
+            coordinator.coordinate(readingItemAt: folder, options: [], error: &coordinatorError) { url in
+                guard let enumerator = FileManager.default.enumerator(at: url,
+                    includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else { return }
+                for case let file as URL in enumerator {
+                    guard ["apkg", "colpkg"].contains(file.pathExtension.lowercased()) else { continue }
+                    let full = file.standardizedFileURL.path
+                    let base = url.standardizedFileURL.path + "/"
+                    if full.hasPrefix(base) { names.append(String(full.dropFirst(base.count))) }
+                    if names.count >= 200 { break }
+                }
+            }
+            if let error = coordinatorError { throw error }
+            return names.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        }
+    }
+
+    private func hash(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func loadLinks() -> [String: [String: String]] {
+        UserDefaults.standard.dictionary(forKey: linkStorageKey) as? [String: [String: String]] ?? [:]
+    }
+    private func saveLinks(_ links: [String: [String: String]]) {
+        UserDefaults.standard.set(links, forKey: linkStorageKey)
+    }
+    private func recoveryURL(deckId: String, hash: String, sourceName: String) throws -> URL {
+        let folder = try FileManager.default.url(for: .applicationSupportDirectory,
+            in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("AnkiSync-Recovery", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let safeId = deckId.map { $0.isLetter || $0.isNumber ? $0 : "_" }
+        let safeName = sourceName.map { $0.isLetter || $0.isNumber || $0 == "." ? $0 : "_" }
+        return folder.appendingPathComponent(String(safeId.prefix(120)) + "_" + String(hash.prefix(16)) + "_" + String(safeName))
+    }
+    // The original package is backed up BEFORE a write can ever be enabled.
+    // The recovery copy is separate in app storage, not within the source archive.
+    private func verifiedRecovery(deckId: String, sourceName: String,
+                                  bytes: Data, expectedHash: String) throws -> String {
+        let url = try recoveryURL(deckId: deckId, hash: expectedHash, sourceName: sourceName)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try bytes.write(to: url, options: .atomic)
+        }
+        let saved = try Data(contentsOf: url)
+        guard saved.count == bytes.count && hash(saved) == expectedHash else {
+            throw NativeError("Recovery backup verification failed. Autosave was not enabled.")
+        }
+        return url.lastPathComponent
+    }
+
+    private func linkFile(deckId: String, path: String) throws -> [String: Any] {
+        let (name, bytes) = try readDeck(path: path)
+        guard name.lowercased().hasSuffix(".apkg"), bytes.count >= 100,
+              bytes.prefix(2) == Data([0x50, 0x4b]) else {
+            throw NativeError("Please link a valid .apkg archive. Original was not modified.")
+        }
+        let digest = hash(bytes)
+        let backup = try verifiedRecovery(deckId: deckId, sourceName: name,
+                                         bytes: bytes, expectedHash: digest)
+        // Confirm the file is still at exactly this version before recording the link.
+        let (_, again) = try readDeck(path: path)
+        guard hash(again) == digest else { throw NativeError("File changed while linking. Reconnect it before enabling autosave.") }
+        var links = loadLinks()
+        links[deckId] = ["path":path, "sha256":digest, "recoveryHash":digest,
+                         "name":name, "backup":backup]
+        saveLinks(links)
+        return ["path":path, "sha256":digest, "name":name, "backup":backup]
+    }
+
+    private func writeLinkedFile(_ request: PendingWrite) throws -> [String: Any] {
+        let links = loadLinks()
+        guard let record = links[request.deckId],
+              record["path"] == request.path,
+              record["sha256"] == request.expectedHash else {
+            throw NativeError("File link changed. Autosave paused; original was not modified.")
+        }
+        guard request.bytes.count >= 100 && request.bytes.prefix(2) == Data([0x50, 0x4b]) else {
+            throw NativeError("New data is not a ZIP/APKG archive. Original was not modified.")
+        }
+        let newHash = hash(request.bytes)
+        let after = try withFolder { folder -> Data in
+            let url = try checkedPath(request.path, under: folder)
+            var coordinationError: NSError?
+            var operationError: Error?
+            var confirmed: Data?
+            let coordinator = NSFileCoordinator(filePresenter: nil)
+            coordinator.coordinate(writingItemAt: url, options: .forReplacing, error: &coordinationError) { target in
+                do {
+                    let old = try Data(contentsOf: target)
+                    guard self.hash(old) == request.expectedHash else {
+                        throw NativeError("Original changed in iCloud since linking. Autosave paused; no overwrite occurred.")
+                    }
+                    // The original recovery copy is immutable: never replace it
+                    // with a later edited version on subsequent autosaves.
+                    guard let firstHash = record["recoveryHash"],
+                          let recoveryName = record["backup"] else {
+                        throw NativeError("Missing recovery metadata. Original not modified.")
+                    }
+                    let initialURL = try self.recoveryURL(deckId: request.deckId,
+                        hash: firstHash, sourceName: record["name"] ?? target.lastPathComponent)
+                    guard initialURL.lastPathComponent == recoveryName,
+                          let backupBytes = try? Data(contentsOf: initialURL),
+                          self.hash(backupBytes) == firstHash else {
+                        throw NativeError("Recovery copy is missing or changed. Original not modified.")
+                    }
+                    // Coordinated atomic replacement. If it fails, preserve the old file.
+                    try request.bytes.write(to: target, options: .atomic)
+                    let verified = try Data(contentsOf: target)
+                    guard verified.count == request.bytes.count && self.hash(verified) == newHash else {
+                        throw NativeError("iCloud readback verification failed. Original may be damaged; restore from the recovery backup before continuing.")
+                    }
+                    confirmed = verified
+                } catch { operationError = error }
+            }
+            if let error = operationError { throw error }
+            if let error = coordinationError { throw error }
+            guard let data = confirmed else { throw NativeError("iCloud write could not be verified.") }
+            return data
+        }
+        let verifiedHash = hash(after)
+        guard verifiedHash == newHash else { throw NativeError("Verification failed after save. Autosave paused.") }
+        var refreshed = loadLinks()
+        // Do not overwrite a link that the user changed while this write was running.
+        guard refreshed[request.deckId]?["sha256"] == request.expectedHash else {
+            throw NativeError("The saved file was updated, but the link changed. Reconnect before saving again.")
+        }
+        refreshed[request.deckId]?["sha256"] = verifiedHash
+        saveLinks(refreshed)
+        return ["sha256":verifiedHash, "name":record["name"] ?? "", "size":after.count]
+    }
+
+    private func transferFile(id: String, name: String, data: Data) {
+        deliver(["kind":"start","id":id,"name":name,"size":data.count]) { [weak self] in
+            self?.transferNextChunk(id: id, data: data, offset: 0)
+        }
+    }
+    private func transferNextChunk(id: String, data: Data, offset: Int) {
+        guard offset < data.count else {
+            deliver(["kind":"complete","id":id]);return
+        }
+        let end = min(offset + chunkLength, data.count)
+        let b64 = data.subdata(in: offset..<end).base64EncodedString()
+        deliver(["kind":"chunk","id":id,"data":b64]) { [weak self] in
+            self?.transferNextChunk(id: id, data: data, offset: end)
+        }
+    }
+    private func reply(_ id: String, data: Any) {
+        deliver(["kind":"result","id":id,"ok":true,"data":data])
+    }
+    private func reply(_ id: String, error: String) {
+        deliver(["kind":"result","id":id,"ok":false,"error":error])
+    }
+    private func deliver(_ object: [String: Any], then: (() -> Void)? = nil) {
+        guard JSONSerialization.isValidJSONObject(object),
+              let bytes = try? JSONSerialization.data(withJSONObject: object),
+              let json = String(data: bytes, encoding: .utf8) else { return }
+        webView.evaluateJavaScript("window.AnkiNative && window.AnkiNative.__deliver(\(json));") { _, error in
+            if let error = error { NSLog("AnkiSync bridge error: %@", error.localizedDescription) }
+            then?()
+        }
+    }
+    private func showError(_ message: String) {
+        let alert = UIAlertController(title: "AnkiSync", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
+    }
+}
+
+private struct NativeError: LocalizedError {
+    let message: String
+    init(_ text: String) { message = text }
+    var errorDescription: String? { message }
+}
