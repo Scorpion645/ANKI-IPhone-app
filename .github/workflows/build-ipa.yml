@@ -9,7 +9,7 @@ permissions:
 jobs:
   build:
     runs-on: macos-latest
-    timeout-minutes: 35fa
+    timeout-minutes: 35
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
