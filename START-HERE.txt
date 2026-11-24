@@ -1,0 +1,3 @@
+FIRST: Read README-LAUNCHSCREEN-v5.txt.
+This version addresses legacy iPhone letterboxing by adding an explicit launch storyboard.
+Build a NEW IPA; HTML-only publishing cannot fix app viewport compatibility.
