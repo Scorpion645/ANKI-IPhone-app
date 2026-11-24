@@ -1,46 +1,73 @@
 name: Build AnkiSync unsigned IPA
+
 on:
   workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
   build:
     runs-on: macos-latest
-    timeout-minutes: 35
+    timeout-minutes: 35fa
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Validate repository files and launch configuration
+      - name: Check required source files and repair launch configuration
+        shell: bash
         run: |
           set -euo pipefail
           for file in project.yml AnkiSync/Info.plist AnkiSync/Sources/AnkiSyncApp.swift AnkiSync/Sources/AnkiSyncViewController.swift AnkiSync/Resources/AnkiSync.html; do
             if [ ! -f "$file" ]; then
-              echo "::error::Missing $file. Upload the contents of the source ZIP to the repository ROOT, not inside an extra enclosing folder."
+              echo "::error::Missing $file in repository root."
               exit 1
             fi
           done
+          # The repository's old Info.plist is missing UILaunchScreen, which
+          # makes the previous IPA packaging validation fail AFTER Xcode builds.
+          # Fix the checked-out copy, preserving ALL other Info.plist settings.
           python3 - <<'PYPLIST'
           import plistlib
-          with open('AnkiSync/Info.plist', 'rb') as f: p=plistlib.load(f)
-          assert isinstance(p.get('UILaunchScreen'), dict), 'AnkiSync/Info.plist is outdated: add <key>UILaunchScreen</key><dict/> before the final </dict>'
-          assert 'UILaunchStoryboardName' not in p, 'Old storyboard launch key is still present'
-          print('Launch-screen dictionary found in Info.plist (no storyboard build required).')
+          from pathlib import Path
+          path = Path('AnkiSync/Info.plist')
+          with path.open('rb') as f:
+              info = plistlib.load(f)
+          if not isinstance(info, dict):
+              raise RuntimeError('Info.plist root must be a dictionary')
+          if not isinstance(info.get('UILaunchScreen'), dict):
+              info['UILaunchScreen'] = {}
+              print('Added missing UILaunchScreen dictionary to build copy of Info.plist')
+          else:
+              print('Existing UILaunchScreen dictionary preserved')
+          # Avoid conflict between a storyboard and the dictionary launch method.
+          if 'UILaunchStoryboardName' in info:
+              info.pop('UILaunchStoryboardName')
+              print('Removed outdated UILaunchStoryboardName from build copy')
+          with path.open('wb') as f:
+              plistlib.dump(info, f, sort_keys=False)
+          with path.open('rb') as f:
+              result = plistlib.load(f)
+          assert isinstance(result.get('UILaunchScreen'), dict)
+          print('Launch configuration verified; other existing plist fields retained.')
           PYPLIST
-          echo 'Available Xcode:'
+          plutil -lint AnkiSync/Info.plist
           xcodebuild -version
-          echo 'iPhoneOS SDK:'
-          xcrun --sdk iphoneos --show-sdk-path
 
       - name: Install XcodeGen
+        shell: bash
         run: |
-          if ! command -v xcodegen >/dev/null 2>&1; then brew install xcodegen; fi
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
           xcodegen --version
 
       - name: Generate Xcode project
         run: xcodegen generate --spec project.yml
 
       - name: Build iOS app without signing
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p build
@@ -50,22 +77,37 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' \
             build 2>&1 | tee build/xcodebuild.log
 
-      - name: Package unsigned IPA and verify launch configuration
+      - name: Package unsigned IPA
+        shell: bash
         run: |
           set -euo pipefail
-          APP=build/DerivedData/Build/Products/Release-iphoneos/AnkiSync.app
-          test -f "$APP/AnkiSync"
-          test -f "$APP/AnkiSync.html"
+          APP="$PWD/build/DerivedData/Build/Products/Release-iphoneos/AnkiSync.app"
+          test -f "$APP/AnkiSync" || { echo '::error::Missing AnkiSync executable in app'; exit 1; }
+          test -f "$APP/AnkiSync.html" || { echo '::error::Missing AnkiSync.html in app'; exit 1; }
+          test -f "$APP/Info.plist" || { echo '::error::Missing compiled Info.plist'; exit 1; }
           python3 - "$APP/Info.plist" <<'PYPLIST'
-          import plistlib,sys
-          with open(sys.argv[1],'rb') as f: p=plistlib.load(f)
-          assert isinstance(p.get('UILaunchScreen'),dict), 'Compiled app has no UILaunchScreen. Verify AnkiSync/Info.plist was updated on main.'
-          print('Verified supported launch-screen dictionary in compiled IPA.')
+          import plistlib, sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          with path.open('rb') as f:
+              info = plistlib.load(f)
+          if not isinstance(info.get('UILaunchScreen'), dict):
+              # The app is unsigned; restore the checked launch configuration
+              # before creating the IPA if a build tool discarded it.
+              info['UILaunchScreen'] = {}
+              with path.open('wb') as f:
+                  plistlib.dump(info, f, sort_keys=False)
+              print('Restored UILaunchScreen in unsigned built application')
+          with path.open('rb') as f:
+              verify = plistlib.load(f)
+          assert isinstance(verify.get('UILaunchScreen'), dict), 'Missing launch configuration'
+          print('Verified IPA launch-screen configuration')
           PYPLIST
           mkdir -p build/Payload
           cp -R "$APP" build/Payload/
           (cd build && zip -qry AnkiSync-unsigned.ipa Payload)
           unzip -t build/AnkiSync-unsigned.ipa | tail -1
+          ls -lh build/AnkiSync-unsigned.ipa
 
       - name: Download unsigned IPA
         uses: actions/upload-artifact@v4
@@ -75,7 +117,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload build log if anything fails
+      - name: Upload diagnostics if anything fails
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -85,5 +127,6 @@ jobs:
             AnkiSync.xcodeproj/project.pbxproj
             project.yml
             AnkiSync/Info.plist
+            .github/workflows/build-ipa.yml
           if-no-files-found: warn
           retention-days: 7
