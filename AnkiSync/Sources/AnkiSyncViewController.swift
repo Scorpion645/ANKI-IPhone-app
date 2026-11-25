@@ -320,6 +320,22 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
                     DispatchQueue.main.async { self.reply(id, error: error.localizedDescription) }
                 }
             }
+        case "renameFile":
+            guard let deckId = obj["deckId"] as? String, !deckId.isEmpty,
+                  let path = obj["path"] as? String,
+                  let newName = obj["newName"] as? String else {
+                reply(id, error: "A deck, existing original path and new filename are required.")
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                do {
+                    let result = try self.renameDeckFile(deckId: deckId, path: path, newName: newName)
+                    DispatchQueue.main.async { self.reply(id, data: result) }
+                } catch {
+                    DispatchQueue.main.async { self.reply(id, error: error.localizedDescription) }
+                }
+            }
         case "exportRecovery":
             guard let deckId = obj["deckId"] as? String,
                   let record = loadLinks()[deckId],
@@ -722,6 +738,76 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
                          "name":name, "backup":backup]
         saveLinks(links)
         return ["path":path, "sha256":digest, "name":name, "backup":backup]
+    }
+
+    // Renames only an existing .apkg in the previously authorized iCloud Anki
+    // folder. Always creates a verified local recovery copy first. The operation
+    // does not touch card data, journal events, or any similarly named file.
+    private func renameDeckFile(deckId: String, path: String, newName: String) throws -> [String: Any] {
+        let blocked = CharacterSet(charactersIn: "/\\:*?\"<>|").union(.controlCharacters)
+        guard newName.utf8.count <= 205, newName.utf8.count > 5,
+              newName.lowercased().hasSuffix(".apkg"),
+              newName.rangeOfCharacter(from: blocked) == nil,
+              !newName.hasPrefix("."), !newName.hasSuffix(" ") else {
+            throw NativeError("The new .apkg filename contains unsupported characters.")
+        }
+        let stem = String(newName.dropLast(5)).uppercased()
+        let reserved = ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"]
+        guard !reserved.contains(stem), !stem.hasSuffix("."), !stem.hasSuffix(" ") else {
+            throw NativeError("The destination filename is reserved on Windows.")
+        }
+        let normalized = path.replacingOccurrences(of: "\\", with: "/")
+        let components = normalized.split(separator: "/")
+        guard !components.isEmpty, components.last.map(String.init)?.lowercased().hasSuffix(".apkg") == true else {
+            throw NativeError("Select an existing .apkg original in the authorized Anki folder.")
+        }
+        let newPath = (components.dropLast().map(String.init) + [newName]).joined(separator: "/")
+        guard normalized != newPath else { return ["ok": true, "path": newPath, "name": newName] }
+        // Read the latest original under file coordination, and preserve it before renaming.
+        let (sourceName, sourceData) = try readDeck(path: normalized)
+        let digest = hash(sourceData)
+        let backup = try verifiedRecovery(deckId: deckId, sourceName: sourceName,
+                                          bytes: sourceData, expectedHash: digest)
+        return try withFolder { folder in
+            let source = try checkedPath(normalized, under: folder)
+            let destination = try checkedPath(newPath, under: folder)
+            guard !FileManager.default.fileExists(atPath: destination.path) else {
+                throw NativeError("A file with that new name already exists. No files were renamed.")
+            }
+            var coordinationError: NSError?
+            var operationError: Error?
+            NSFileCoordinator(filePresenter: nil).coordinate(
+                writingItemAt: source, options: .forMoving,
+                writingItemAt: destination, options: [], error: &coordinationError) { from, to in
+                    do {
+                        guard !FileManager.default.fileExists(atPath: to.path) else {
+                            throw NativeError("The destination .apkg already exists; no overwrite permitted.")
+                        }
+                        let present = try Data(contentsOf: from)
+                        guard self.hash(present) == digest else {
+                            throw NativeError("The original changed while preparing to rename. Nothing was changed.")
+                        }
+                        try FileManager.default.moveItem(at: from, to: to)
+                        let moved = try Data(contentsOf: to)
+                        guard self.hash(moved) == digest else {
+                            throw NativeError("File renamed but verification failed. Check both filenames before trying again.")
+                        }
+                    } catch { operationError = error }
+                }
+            if let error = operationError { throw error }
+            if let error = coordinationError { throw error }
+            // Preserve existing original-file autosave's verified source hash and
+            // independent recovery backup, but update its URL to the new name.
+            var links = loadLinks()
+            if var link = links[deckId], link["path"] == normalized {
+                link["path"] = newPath
+                link["name"] = newName
+                links[deckId] = link
+                saveLinks(links)
+            }
+            return ["ok":true,"path":newPath,"name":newName,
+                    "sha256":digest,"backup":backup]
+        }
     }
 
     private func writeLinkedFile(_ request: PendingWrite) throws -> [String: Any] {
