@@ -242,6 +242,16 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
                              "links": permitted ? loadLinks() : [:]])
         case "versionCapabilities":
             reply(id, data: ["format":1,"maxBytes":maxVersionBytes,"maxVersions":maxVersionsPerDeviceDeck])
+        case "versionCatalog":
+            guard let key = obj["key"] as? String, let checkpoint = obj["checkpoint"] as? String else {
+                reply(id, error: "Missing checkpoint identity"); return
+            }
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { return }
+                do { let entries = try self.catalogVersions(key: key, checkpoint: checkpoint)
+                    DispatchQueue.main.async { self.reply(id, data: entries) }
+                } catch { DispatchQueue.main.async { self.reply(id, error: error.localizedDescription) } }
+            }
         case "versionList":
             guard let key = obj["key"] as? String, let device = obj["device"] as? String else {
                 reply(id, error: "Missing version identity"); return
@@ -782,6 +792,35 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
             .appendingPathComponent(key, isDirectory: true).appendingPathComponent(device, isDirectory: true)
         guard dir.resolvingSymlinksInPath().path == dir.path else { throw NativeError("Version directory is a symbolic link") }
         return dir
+    }
+    private func coordinatedVersionNames(_ dir: URL) throws -> [String] {
+        var names: [String] = []; var failure: Error?; var coordinationError: NSError?
+        NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: dir, options: [], error: &coordinationError) { url in
+            do { names = try FileManager.default.contentsOfDirectory(atPath: url.path).sorted() }
+            catch { failure = error }
+        }
+        if let error = coordinationError { throw error }; if let error = failure { throw error }
+        return names
+    }
+    private func catalogVersions(key: String, checkpoint: String) throws -> [[String: String]] {
+        guard validVersionDigest(checkpoint) else { throw NativeError("Invalid checkpoint") }
+        return try withFolder { root in
+            let dummy = "device-" + String(repeating: "0", count: 32)
+            let dir = try versionDirectory(root, key: key, device: dummy).deletingLastPathComponent()
+            if !FileManager.default.fileExists(atPath: dir.path) { return [] }
+            let devices = try coordinatedVersionNames(dir)
+            var entries: [[String: String]] = []
+            for device in devices where self.validVersionIdentity(key: key, device: device) {
+                let child = try versionDirectory(root, key: key, device: device)
+                guard (try child.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true else { continue }
+                let names = try coordinatedVersionNames(child)
+                for name in names where self.validVersionName(name) && name.hasPrefix("checkpoint-" + checkpoint + "-") {
+                    entries.append(["device":device,"name":name])
+                    if entries.count > 64 { throw NativeError("Too many matching archive versions") }
+                }
+            }
+            return entries
+        }
     }
     private func listVersions(key: String, device: String) throws -> [String] {
         try withFolder { root in

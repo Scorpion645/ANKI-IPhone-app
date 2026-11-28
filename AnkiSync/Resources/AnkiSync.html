@@ -111,6 +111,7 @@
   };
   // Separate, create-only native archive version transport. No original links.
   native.versionCapabilities=()=>call('versionCapabilities');
+  native.versionCatalog=(key,checkpoint)=>call('versionCatalog',{key,checkpoint});
   native.versionList=(key,device)=>call('versionList',{key,device});
   native.versionRead=(key,device,name)=>call('versionRead',{key,device,name});
   native.versionWrite=async function(key,device,checkpoint,sha256,blob){
@@ -12728,6 +12729,10 @@ async function verifyCopy(id,manual=false){
     if(!zip.file('collection.anki2'))throw Error('Archive database missing');
     const t=transport(),names=await t.list(state.key),result=await compareArchiveCopy(zip,id,deck,state,local,name,names);
     if(deck!==appState.decks[id]||state!==deck.ankiJournal||sig!==copySig(deck)||!copyClean(id,deck)||diff(state.shadow,current(id)).length||!equivalentCards(local,current(id)))throw Error('Local changes arrived during verification');
+    if(result.text==='Archive pending · older checkpoint'){
+      try{const independent=await checkIndependentCopy(id,deck,state,local,t);if(independent){setCopy(id,sig,'ok',independent.text,independent.detail+' · canonical: older checkpoint',COPY_RECHECK);return;}}
+      catch(e){result.detail+=' · independent check pending: '+String(e?.message||e);}
+    }
     const detail=result.detail+' · '+(compact?'Compact v1':'Legacy')+' · '+(blob.size/1048576).toFixed(2)+' MiB · checked '+new Date().toLocaleTimeString();
     setCopy(id,sig,result.level,result.text,detail,result.level==='ok'?COPY_RECHECK:COPY_RETRY);
   }catch(e){setCopy(id,sig,'waiting','Archive not verified',String(e?.message||e)+' · automatic retry; no files changed',COPY_RETRY);}
@@ -12747,7 +12752,7 @@ function tickCopy(){
 // existing desktop continues to own the canonical named archive. Versions
 // are never automatically imported, renamed, replaced, or deleted.
 const versionStates=new Map();let versionJob=null,versionCapability=null,versionCapabilityBusy=false;
-const VERSION_QUIET=90000,VERSION_RETRY=60000,VERSION_MIN_GAP=600000;
+const VERSION_QUIET=90000,VERSION_RETRY=60000,VERSION_MIN_GAP=120000;
 function versionPilotKey(id){const k=appState?.decks?.[id]?.ankiJournal?.key;return /^deck-[a-f0-9]{16}$/.test(k||'')?'AnkiSync-VersionPilot-v1:'+k:null;}
 function versionPilotEnabled(id){try{const k=versionPilotKey(id);return !!k&&localStorage.getItem(k)==='1';}catch(_){return false;}}
 function versionLabel(id){if(!versionPilotEnabled(id))return 'Independent archive pilot: off';return versionStates.get(String(id))?.message||'Independent archive: waiting for journal';}
@@ -12767,18 +12772,49 @@ function toggleVersionPilot(id){
 }
 function versionReport(id,state,message){state.message=message;const el=document.getElementById('ankiVersionDetail-'+id);if(el&&el.textContent!==message)el.textContent=message;}
 function versionAllowed(id,deck){return !!(versionPilotEnabled(id)&&root.navigator?.onLine!==false&&document.visibilityState==='visible'&&copyClean(id,deck)&&deck?.cards?.length&&validArchiveName(deck.sourceFileName)&&!jobs.has(id)&&!archiveBusy.size&&!recoveryJobs.size&&!diff(deck.ankiJournal.shadow,current(id)).length);}
+// Cross-device archive discovery: the journal remains authoritative.
 async function versionCheckpoint(deck,local,seen){return archiveSHA(new Blob([core.canonical({key:deck.ankiJournal.key,seen,title:deck.name,sourceName:deck.sourceFileName,cards:local})]));}
-async function verifyVersionZip(zip,id,deck,state,local,history,name,checkpoint){
+async function verifyVersionZip(zip,id,deck,state,local,history,name,checkpoint,device=state.device){
   if(!zip.file('collection.anki2'))throw Error('Version database missing');
   const marker=JSON.parse(await zip.file('ankisync-version.json')?.async('string')||'null');
-  if(marker?.format!=='AnkiSyncImmutableVersion'||marker.version!==1||marker.deckKey!==state.key||marker.device!==state.device||marker.checkpoint!==checkpoint||marker.originalName!==name)throw Error('Version marker differs');
+  if(marker?.format!=='AnkiSyncImmutableVersion'||marker.version!==1||marker.deckKey!==state.key||marker.device!==device||marker.checkpoint!==checkpoint||marker.originalName!==name)throw Error('Version marker differs');
   const result=await compareArchiveCopy(zip,id,deck,state,local,name,['manifest.json',...history.names]);
-  if(result.level!=='ok')throw Error('Version checkpoint not verified: '+result.text);
+  if(result.level!=='ok'||result.stamp.device!==device)throw Error('Version checkpoint or publisher not verified: '+result.text);
   const embedded=JSON.parse(await zip.file('ankisync-journal.json').async('string'));
   if(core.canonical(embedded.history.manifest)!==core.canonical(history.manifest)||core.canonical(embedded.history.events)!==core.canonical(history.events))throw Error('Version history differs from replayed journal');
-  // Independently validate the SQLite database and card count before write.
   const SQL=await initSqlJs(),db=new SQL.Database(await zip.file('collection.anki2').async('uint8array'));
   try{if(db.exec('PRAGMA quick_check')[0]?.values?.[0]?.[0]!=='ok'||Number(db.exec('SELECT count(*) FROM cards')[0]?.values?.[0]?.[0])!==local.length)throw Error('Version database check failed');}finally{db.close();}
+  return result;
+}
+async function discoverVersion(id,deck,state,local,history,t){
+  const key=state.key, name=deck.sourceFileName, sig=copySig(deck), checkpoint=await versionCheckpoint(deck,local,state.seen);
+  const native=root.AnkiNative?.available?root.AnkiNative:null;
+  let entries;
+  if(native){if(!native.versionCatalog)return null;entries=await native.versionCatalog(key,checkpoint);}
+  else if(root.AnkiPCBridge?.available){entries=await (await archiveReq('version/catalog',{key,checkpoint})).json();}
+  else return null;
+  const pattern=new RegExp('^checkpoint-'+checkpoint+'-[a-f0-9]{64}\\.apkg$');
+  if(!Array.isArray(entries)||entries.length>64||entries.some(e=>!/^device-[a-f0-9]{32}$/.test(e?.device||'')||!pattern.test(e?.name||'')))throw Error('Invalid version catalog');
+  let lastError=null;
+  for(const e of entries){
+    try{
+      const file=native?await native.versionRead(key,e.device,e.name):await (await archiveReq('version/read',{key,device:e.device,name:e.name})).blob();
+      if(!file||file.size<100||file.size>64*1024*1024||await archiveSHA(file)!==e.name.slice(-69,-5))throw Error('Version SHA-256 differs');
+      const zip=await ankiValidateZipBlob(file);
+      const result=await verifyVersionZip(zip,id,deck,state,local,history,name,checkpoint,e.device);
+      const latestNames=await t.list(key);
+      if(deck!==appState.decks[id]||state!==deck.ankiJournal||sig!==copySig(deck)||!copyClean(id,deck)||diff(state.shadow,current(id)).length||!equivalentCards(local,current(id))||!archiveVector(history.names,pendingList(latestNames)))throw Error('Journal changed during version discovery');
+      return {level:'ok',text:'Independent archive matches local journal',detail:result.detail+' · verified '+(e.device===state.device?'this device':'another device')+' version · '+(file.size/1048576).toFixed(2)+' MiB · original named archive may still be older',device:e.device,checkpoint};
+    }catch(e){lastError=e;}
+  }
+  if(lastError)throw Error('Matching independent version could not be verified: '+String(lastError.message||lastError));
+  return null;
+}
+async function checkIndependentCopy(id,deck,state,local,t){
+  const manifest=await readManifest(t,state.key,id);if(!manifest)return null;
+  const history=await replay(t,state.key,id,manifest,local,true);
+  if(!history.match||!equivalentCards(history.cards,local)||!archiveVector(history.seen,state.seen))throw Error('Visible journal not settled');
+  return discoverVersion(id,deck,state,local,history,t);
 }
 async function publishVersion(id,v){
   const deck=appState.decks[id],state=deck.ankiJournal,local=clone(current(id)),name=deck.sourceFileName,title=deck.name;
@@ -12790,6 +12826,9 @@ async function publishVersion(id,v){
     const history=await replay(t,state.key,id,manifest,local,true);
     if(!history.match||!equivalentCards(history.cards,local)||!archiveVector(history.seen,seen)||!stable())throw Error('Entire visible journal is not settled');
     const checkpoint=await versionCheckpoint(deck,local,seen),prefix='checkpoint-'+checkpoint+'-';
+    const peer=await discoverVersion(id,deck,state,local,history,t);
+    if(peer&&stable()){v.savedSig=sig;versionReport(id,v,peer.text+' · '+peer.detail);setCopy(id,sig,'ok',peer.text,peer.detail,COPY_RECHECK);return;}
+    if(!stable())throw Error('Journal changed during discovery');
     const names=await native.versionList(state.key,state.device);
     if(!Array.isArray(names)||names.some(n=>!/^checkpoint-[a-f0-9]{64}-[a-f0-9]{64}\.apkg$/.test(n)))throw Error('Invalid version inventory');
     const existing=names.filter(n=>n.startsWith(prefix));
@@ -12818,7 +12857,7 @@ async function publishVersion(id,v){
     if(!stable()||!archiveVector(history.names,pendingList(await t.list(state.key))))throw Error('Journal changed before version write');
     const result=await native.versionWrite(state.key,state.device,checkpoint,digest,output);
     if(result?.sha256!==digest||result?.name!==prefix+digest+'.apkg'||result?.size!==output.size)throw Error('Native version readback verification failed');
-    v.lastWrite=Date.now();if(stable())v.savedSig=sig;
+    v.lastWrite=Date.now();const afterWrite=await t.list(state.key);if(stable()&&archiveVector(history.names,pendingList(afterWrite))){v.savedSig=sig;setCopy(id,sig,'ok','Independent archive matches local journal','New version saved and SHA-256 verified on this device · original named archive may still be older',COPY_RECHECK);}
     versionReport(id,v,'Independent archive: saved and SHA-256 verified · '+(output.size/1048576).toFixed(2)+' MiB · '+new Date().toLocaleTimeString());
   }catch(e){versionReport(id,v,'Independent archive: held safely · '+String(e?.message||e));console.warn('Archive version:',e);}
   finally{versionJob=null;}
@@ -12832,8 +12871,11 @@ function tickVersion(){
     let v=versionStates.get(id);if(!v){v={sig:null,since:now,next:0,lastWrite:0};versionStates.set(id,v);}
     if(!copyClean(id,deck)||!deck.cards?.length||!validArchiveName(deck.sourceFileName)){v.sig=null;v.since=now;continue;}
     const sig=copySig(deck);if(v.sig!==sig){v.sig=sig;v.since=now;v.next=0;v.limit=false;versionReport(id,v,'Independent archive: waiting for stable checkpoint');}
-    if(v.savedSig===sig||v.limit||now-v.since<VERSION_QUIET||now<v.next||now-v.lastWrite<VERSION_MIN_GAP||!versionAllowed(id,deck))continue;
-    if(copyPresentation(id).level==='ok'){versionReport(id,v,'Independent archive: original already verified; no extra version needed');v.next=now+30000;continue;}
+    if(v.savedSig===sig&&copyPresentation(id).level==='ok')continue;
+    if(v.limit||!versionAllowed(id,deck))continue;
+    const delay=Math.max(v.since+VERSION_QUIET,v.next,(v.lastWrite||0)+VERSION_MIN_GAP)-now;
+    if(delay>0){versionReport(id,v,'Independent archive: next check in '+Math.ceil(delay/1000)+'s');continue;}
+    if(copyPresentation(id).level==='ok'){versionReport(id,v,'Independent archive: current archive verified; no extra version needed');v.next=now+30000;continue;}
     void publishVersion(id,v);break;
   }
 }
