@@ -15,7 +15,7 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
     private let updateHTMLName = "AnkiSync.html"
     private let updateSignatureName = "AnkiSync.sig"
     private let maxUpdateBytes = 8 * 1024 * 1024
-    private let installedAppVersionKey = "AnkiSync.RuntimeBundledVersion.v1"
+    private let uiUpdateLock = NSRecursiveLock()
     private var hasLaunchedUpdateCheck = false
     private let bookmarkKey = "AnkiSync.iCloudFolderBookmark.v1"
     private var pendingPickerID: String?
@@ -241,7 +241,7 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
                              "folder": permitted ? (folder?.lastPathComponent ?? "") : "",
                              "links": permitted ? loadLinks() : [:]])
         case "versionCapabilities":
-            reply(id, data: ["format":1,"maxBytes":maxVersionBytes,"maxVersions":maxVersionsPerDeviceDeck])
+            reply(id, data: ["format":1,"maxBytes":maxVersionBytes,"maxVersions":maxVersionsPerDeviceDeck,"retention":"local-backup-v1"])
         case "versionCatalog":
             guard let key = obj["key"] as? String, let checkpoint = obj["checkpoint"] as? String else {
                 reply(id, error: "Missing checkpoint identity"); return
@@ -851,6 +851,67 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
             return try readVersionAt(dir.appendingPathComponent(name), digest: digest)
         }
     }
+    private func retirementPlan(_ dir: URL, key: String, device: String, names: [String]) throws -> [(String, URL)] {
+        if names.count < maxVersionsPerDeviceDeck { return [] }
+        guard names.count <= maxVersionsPerDeviceDeck + 1 else { throw NativeError("Version retention needs inspection; all files kept") }
+        var ordered: [(String, Date)] = []
+        for name in names {
+            let url = dir.appendingPathComponent(name)
+            guard url.resolvingSymlinksInPath().path == url.standardizedFileURL.path,
+                  let date = try url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate else {
+                throw NativeError("Version timestamp unavailable; all files kept")
+            }
+            ordered.append((name, date))
+        }
+        ordered.sort { lhs, rhs in
+            if lhs.1 == rhs.1 { return lhs.0 < rhs.0 }
+            return lhs.1 < rhs.1
+        }
+        let local: URL = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("AnkiSync-RetiredVersions", isDirectory: true)
+            .appendingPathComponent(key, isDirectory: true).appendingPathComponent(device, isDirectory: true)
+        guard local.resolvingSymlinksInPath().path == local.standardizedFileURL.path else { throw NativeError("Recovery folder link forbidden") }
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        var prepared: [(String, URL)] = []
+        for (name, _) in ordered.prefix(names.count - maxVersionsPerDeviceDeck + 1) {
+            let src = dir.appendingPathComponent(name)
+            let digest = String(name.dropLast(5).suffix(64))
+            let bytes = try readVersionUncoordinated(src, digest: digest)
+            let backup = local.appendingPathComponent(name)
+            guard backup.resolvingSymlinksInPath().path == backup.standardizedFileURL.path else { throw NativeError("Recovery file link forbidden") }
+            if !FileManager.default.fileExists(atPath: backup.path) {
+                let temp = local.appendingPathComponent(".retire-" + UUID().uuidString + ".tmp")
+                defer { try? FileManager.default.removeItem(at: temp) }
+                try bytes.write(to: temp, options: Data.WritingOptions.atomic)
+                try FileManager.default.moveItem(at: temp, to: backup)
+            }
+            guard try readVersionUncoordinated(backup, digest: digest).count == bytes.count else { throw NativeError("Local retirement backup differs; iCloud version retained") }
+            prepared.append((name, backup))
+        }
+        return prepared
+    }
+    // Caller holds the directory coordination; do not nest a coordinator.
+    private func readVersionUncoordinated(_ url: URL, digest: String) throws -> Data {
+        guard url.resolvingSymlinksInPath().path == url.standardizedFileURL.path else { throw NativeError("Version file link forbidden") }
+        let info = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard info.isRegularFile == true, let count = info.fileSize, count >= 100, count <= maxVersionBytes else { throw NativeError("Version unavailable or exceeds limit") }
+        let bytes = try Data(contentsOf: url)
+        guard bytes.count == count, hash(bytes) == digest else { throw NativeError("Version checksum differs; iCloud version retained") }
+        return bytes
+    }
+    private func finishRetirement(_ dir: URL, prepared: [(String, URL)]) throws -> Int {
+        var count = 0
+        for (name, backup) in prepared {
+            let src = dir.appendingPathComponent(name)
+            let digest = String(name.dropLast(5).suffix(64))
+            guard FileManager.default.fileExists(atPath: src.path) else { continue }
+            _ = try readVersionUncoordinated(backup, digest: digest)
+            _ = try readVersionUncoordinated(src, digest: digest)
+            try FileManager.default.removeItem(at: src)
+            count += 1
+        }
+        return count
+    }
     private func writeVersion(_ request: PendingVersion) throws -> [String: Any] {
         guard validVersionIdentity(key: request.key, device: request.device), validVersionDigest(request.checkpoint),
               validVersionDigest(request.digest), request.bytes.count == request.size, request.size <= maxVersionBytes,
@@ -862,6 +923,7 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
             let dir = try versionDirectory(root, key: request.key, device: request.device)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             var coordinateError: NSError?; var failure: Error?
+            var retired = 0; var retirementWarning: String?
             NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: dir, options: .forMerging, error: &coordinateError) { targetDir in
                 do {
                     let target = targetDir.appendingPathComponent(name)
@@ -870,18 +932,23 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
                     guard !names.contains(where: { $0.hasPrefix("checkpoint-" + request.checkpoint + "-") }) else {
                         throw NativeError("Checkpoint already has another version; verify it before retrying")
                     }
-                    guard names.count < self.maxVersionsPerDeviceDeck else { throw NativeError("Version pilot limit reached; existing backups kept") }
+                    let prepared = try self.retirementPlan(targetDir, key: request.key, device: request.device, names: names)
                     let temp = targetDir.appendingPathComponent(".ankisync-version-" + UUID().uuidString + ".tmp")
                     defer { try? FileManager.default.removeItem(at: temp) }
                     try request.bytes.write(to: temp, options: .atomic)
                     guard !FileManager.default.fileExists(atPath: target.path) else { throw NativeError("Version already appeared; retry verification") }
                     try FileManager.default.moveItem(at: temp, to: target)
+                    guard try self.readVersionUncoordinated(target, digest: request.digest).count == request.size else { throw NativeError("Version readback length differs") }
+                    do { retired = try self.finishRetirement(targetDir, prepared: prepared) }
+                    catch { retirementWarning = error.localizedDescription }
                 } catch { failure = error }
             }
             if let error = coordinateError { throw error }; if let error = failure { throw error }
             let verified = try readVersionAt(dir.appendingPathComponent(name), digest: request.digest)
             guard verified.count == request.size else { throw NativeError("Version readback length differs") }
-            return ["saved":true,"name":name,"sha256":request.digest,"size":verified.count]
+            var result: [String: Any] = ["saved":true,"name":name,"sha256":request.digest,"size":verified.count,"retired":retired]
+            if let warning = retirementWarning { result["retirementWarning"] = warning }
+            return result
         }
     }
 
@@ -1102,17 +1169,35 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
         return try Data(contentsOf: url)
     }
 
+    // Signed revision is part of the HTML bytes; legacy unversioned UI is revision 0.
+    private func uiRevision(_ data: Data) -> Int {
+        let text = String(decoding: data.prefix(1024), as: UTF8.self)
+        let pattern = #"<meta name="ankisync-ui-revision" content="([1-9][0-9]{0,8})">"#
+        guard let re = try? NSRegularExpression(pattern: pattern),
+              let match = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let range = Range(match.range(at: 1), in: text) else { return 0 }
+        return Int(text[range]) ?? 0
+    }
     private func prepareRuntimeHTML() throws -> URL {
+        uiUpdateLock.lock(); defer { uiUpdateLock.unlock() }
         let dest = try runtimeHTMLURL()
-        let bundleVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? "1"
-        // Once per IPA upgrade, promote the newer trusted bundled UI to the stable
-        // runtime path. A signed iCloud release can replace it again afterwards.
-        if !FileManager.default.fileExists(atPath: dest.path) ||
-                UserDefaults.standard.string(forKey: installedAppVersionKey) != bundleVersion {
-            try bundledHTML().write(to: dest, options: .atomic)
-            UserDefaults.standard.set(bundleVersion, forKey: installedAppVersionKey)
+        let bundled = try bundledHTML()
+        let bundledRevision = uiRevision(bundled)
+        guard bundledRevision > 0 else { throw NativeError("Bundled UI revision missing") }
+        let runtime = try? Data(contentsOf: dest)
+        let runtimeRevision = runtime.map(uiRevision) ?? 0
+        // A same-revision mismatch is resolved in favor of the trusted bundle.
+        // Preserve a legitimately newer signed runtime across IPA upgrades.
+        if runtime == nil || runtimeRevision < bundledRevision || (runtimeRevision == bundledRevision && runtime != bundled) {
+            try bundled.write(to: dest, options: .atomic)
         }
         return dest
+    }
+    private func checkUIRevision(_ data: Data) throws {
+        let current = try Data(contentsOf: prepareRuntimeHTML())
+        let incoming = uiRevision(data), installed = uiRevision(current)
+        guard incoming > 0, incoming >= installed else { throw NativeError("Older or unversioned interface update blocked. Current UI kept.") }
+        guard incoming != installed || hash(data) == hash(current) else { throw NativeError("Different interface has the same revision. Current UI kept.") }
     }
 
     private func loadAppHTML() throws {
@@ -1121,11 +1206,14 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
     }
 
     private func restoreBundledHTML() throws {
+        uiUpdateLock.lock(); defer { uiUpdateLock.unlock() }
         let dest = try runtimeHTMLURL()
         try bundledHTML().write(to: dest, options: .atomic)
     }
 
     private func installSignedHTML(_ data: Data) throws {
+        uiUpdateLock.lock(); defer { uiUpdateLock.unlock() }
+        try checkUIRevision(data)
         let dest = try runtimeHTMLURL()
         let previous = dest.deletingLastPathComponent().appendingPathComponent("AnkiSync.previous.html")
         if FileManager.default.fileExists(atPath: dest.path) {
@@ -1184,7 +1272,9 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
     }
 
     private func checkSignedUpdate() throws -> [String: Any] {
+        uiUpdateLock.lock(); defer { uiUpdateLock.unlock() }
         let data = try verifiedCloudUpdate()
+        try checkUIRevision(data)
         let newHash = hash(data)
         let current = try hash(Data(contentsOf: prepareRuntimeHTML()))
         return ["available":newHash != current,

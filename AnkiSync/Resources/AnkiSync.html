@@ -2,6 +2,7 @@
 <!-- AnkiSync v3: compact iCloud-journal dashboard and iPhone screen-fit update. -->
 <html lang="en">
 <head>
+<meta name="ankisync-ui-revision" content="12">
 <script id="ankisync-ios-native-file-bridge">
 /* Native-only extension. It does not modify card formatting or review logic. */
 (function () {
@@ -6915,8 +6916,8 @@ const content = await zip.generateAsync({ type: "blob" });
                 class="px-2.5 py-1.5 rounded-lg font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300" title="Safely rebuild the same iCloud .apkg from this device after journal sync">Check archive publisher</button>`}
               <button type="button" onclick="AnkiSyncJournal.verifyCopy(decodeURIComponent('${syncIdArg}'),true)" class="px-2.5 py-1.5 rounded-lg font-semibold bg-slate-700 border border-slate-600 text-slate-200">Verify archive (read only)</button>
             </div>
-            ${window.AnkiNative?.available?`<div id="ankiVersionDetail-${ankiEscapeHtml(deckId)}" class="text-[11px] text-slate-400 pt-2">${ankiEscapeHtml(window.AnkiSyncJournal?.versionLabel?.(deckId)||'Independent archive pilot: off')}</div>
-              <button type="button" id="ankiVersionToggle-${ankiEscapeHtml(deckId)}" onclick="AnkiSyncJournal.toggleVersionPilot(decodeURIComponent('${syncIdArg}'))" class="mt-1 px-2.5 py-1.5 rounded-lg font-semibold bg-indigo-500/15 border border-indigo-500/40 text-indigo-300" title="One-time per-deck pilot. Creates separate immutable versions; never changes the main original archive.">${window.AnkiSyncJournal?.versionPilotEnabled?.(deckId)?'Pause independent archive pilot':'Enable independent archive pilot'}</button>`:''}
+            ${(window.AnkiNative?.available||window.AnkiPCBridge?.available)?`<div id="ankiVersionDetail-${ankiEscapeHtml(deckId)}" class="text-[11px] text-slate-400 pt-2">${ankiEscapeHtml(window.AnkiSyncJournal?.versionLabel?.(deckId)||'Independent archive: paused')}</div>
+              <button type="button" id="ankiVersionToggle-${ankiEscapeHtml(deckId)}" onclick="AnkiSyncJournal.toggleVersionPilot(decodeURIComponent('${syncIdArg}'))" class="mt-1 px-2.5 py-1.5 rounded-lg font-semibold bg-indigo-500/15 border border-indigo-500/40 text-indigo-300" title="Automatic per-deck version publishing. Creates separate immutable versions; never changes the main original archive.">${window.AnkiSyncJournal?.versionPilotEnabled?.(deckId)?'Pause independent publishing':'Resume independent publishing'}</button>`:''}
             <div id="ankiCopyDetail-${ankiEscapeHtml(deckId)}" class="text-[11px] text-slate-400 pt-2">${ankiEscapeHtml(window.AnkiSyncJournal?.copyPresentation(deckId).detail||'')}</div>
             ${`<div class="text-[11px] text-slate-400 pt-2" id="ankiArchiveMirror-${ankiEscapeHtml(deckId)}">${ankiEscapeHtml(window.AnkiSyncJournal?.archiveLabel(deckId)||'Archive publisher: designated desktop')}</div>`}
           </details>`;
@@ -12748,30 +12749,39 @@ function tickCopy(){
   }
 }
 
-// Mobile version pilot: the shared journal remains the authority, and the
+// Independent version publishing: the shared journal remains the authority, and the
 // existing desktop continues to own the canonical named archive. Versions
-// are never automatically imported, renamed, replaced, or deleted.
-const versionStates=new Map();let versionJob=null,versionCapability=null,versionCapabilityBusy=false;
+// are never automatically imported or replaced. A native retention bridge may
+// retire old versions from the active folder only after verified local backup.
+const versionStates=new Map();let versionJob=null,versionCapability=null,versionCapabilityBusy=false,versionCapabilityRetry=0,versionCursor=0;
 const VERSION_QUIET=90000,VERSION_RETRY=60000,VERSION_MIN_GAP=120000;
 function versionPilotKey(id){const k=appState?.decks?.[id]?.ankiJournal?.key;return /^deck-[a-f0-9]{16}$/.test(k||'')?'AnkiSync-VersionPilot-v1:'+k:null;}
-function versionPilotEnabled(id){try{const k=versionPilotKey(id);return !!k&&localStorage.getItem(k)==='1';}catch(_){return false;}}
-function versionLabel(id){if(!versionPilotEnabled(id))return 'Independent archive pilot: off';return versionStates.get(String(id))?.message||'Independent archive: waiting for journal';}
+function versionPilotEnabled(id){try{const k=versionPilotKey(id);return !!k&&localStorage.getItem(k)!=='0';}catch(_){return false;}}
+function versionLabel(id){if(!versionPilotEnabled(id))return 'Independent archive: paused';return versionStates.get(String(id))?.message||'Independent archive: waiting for journal';}
 function toggleVersionPilot(id){
   id=String(id);const key=versionPilotKey(id);
-  if(!key||!root.AnkiNative?.available||!versionCapability){showToast('Independent archive pilot requires the new native IPA and an enabled journal.');return;}
+  if(!key||!versionWriter()||!versionCapability){showToast('Independent archive publication requires a compatible bridge and an enabled journal.');return;}
   try{
     const next=versionPilotEnabled(id)?'0':'1';
-    if(next==='1'&&Object.keys(appState.decks).some(other=>other!==id&&versionPilotEnabled(other))){showToast('Pause the other deck pilot first. This release tests one deck at a time.');return;}
     localStorage.setItem(key,next);
     if(localStorage.getItem(key)!==next)throw Error('Pilot preference not persisted');
     const v=versionStates.get(id)||{};v.sig=null;v.since=Date.now();v.next=0;v.limit=false;versionStates.set(id,v);
-    versionReport(id,v,next==='1'?'Independent archive: waiting for stable checkpoint':'Independent archive pilot: off');
-    const el=document.getElementById('ankiVersionToggle-'+id);if(el)el.textContent=next==='1'?'Pause independent archive pilot':'Enable independent archive pilot';
-    showToast(next==='1'?'Independent archive pilot enabled for this deck. Original files unchanged.':'Independent archive pilot paused. Existing versions kept.');
+    versionReport(id,v,next==='1'?'Independent archive: waiting for stable checkpoint':'Independent archive: paused');
+    const el=document.getElementById('ankiVersionToggle-'+id);if(el)el.textContent=next==='1'?'Pause independent publishing':'Resume independent publishing';
+    showToast(next==='1'?'Independent archive publishing enabled for this deck. Original files unchanged.':'Independent archive publishing paused. Existing versions kept.');
   }catch(e){showToast('Independent archive pilot preference could not be saved: '+e.message);}
 }
 function versionReport(id,state,message){state.message=message;const el=document.getElementById('ankiVersionDetail-'+id);if(el&&el.textContent!==message)el.textContent=message;}
-function versionAllowed(id,deck){return !!(versionPilotEnabled(id)&&root.navigator?.onLine!==false&&document.visibilityState==='visible'&&copyClean(id,deck)&&deck?.cards?.length&&validArchiveName(deck.sourceFileName)&&!jobs.has(id)&&!archiveBusy.size&&!recoveryJobs.size&&!diff(deck.ankiJournal.shadow,current(id)).length);}
+function versionWriter(){
+  if(root.AnkiNative?.available&&root.AnkiNative.versionCapabilities)return root.AnkiNative;
+  if(!root.AnkiPCBridge?.available)return null;
+  return {versionCapabilities:async()=> (await archiveReq('version/capabilities',{})).json(),
+    versionList:async(key,device)=> (await archiveReq('version/list',{key,device})).json(),
+    versionRead:async(key,device,name)=> (await archiveReq('version/read',{key,device,name})).blob(),
+    versionWrite:async(key,device,checkpoint,sha256,blob)=> (await archiveReq('version/write',{key,device,checkpoint,sha256},blob,{'Content-Type':'application/octet-stream'})).json()};
+}
+function versionSourceOK(deck){const name=deck?.sourceFileName,path=String(deck?.sourceFilePath||name||'').replace(/\\/g,'/').replace(/^Anki\//,'');return validArchiveName(name)&&path===name;}
+function versionAllowed(id,deck){return !!(versionPilotEnabled(id)&&root.navigator?.onLine!==false&&document.visibilityState==='visible'&&copyClean(id,deck)&&deck?.cards?.length&&versionSourceOK(deck)&&!jobs.has(id)&&!archiveBusy.size&&!recoveryJobs.size&&!diff(deck.ankiJournal.shadow,current(id)).length);}
 // Cross-device archive discovery: the journal remains authoritative.
 async function versionCheckpoint(deck,local,seen){return archiveSHA(new Blob([core.canonical({key:deck.ankiJournal.key,seen,title:deck.name,sourceName:deck.sourceFileName,cards:local})]));}
 async function verifyVersionZip(zip,id,deck,state,local,history,name,checkpoint,device=state.device){
@@ -12818,7 +12828,7 @@ async function checkIndependentCopy(id,deck,state,local,t){
 }
 async function publishVersion(id,v){
   const deck=appState.decks[id],state=deck.ankiJournal,local=clone(current(id)),name=deck.sourceFileName,title=deck.name;
-  const seen=clone(state.seen),sig=copySig(deck),native=root.AnkiNative;
+  const seen=clone(state.seen),sig=copySig(deck),native=versionWriter();
   const stable=()=>deck===appState.decks[id]&&state===deck.ankiJournal&&copySig(deck)===sig&&versionAllowed(id,deck)&&equivalentCards(local,current(id))&&core.canonical(seen)===core.canonical(state.seen);
   versionJob=id;v.next=Date.now()+VERSION_RETRY;versionReport(id,v,'Independent archive: verifying journal…');
   try{
@@ -12840,7 +12850,7 @@ async function publishVersion(id,v){
       if(!stable()||!archiveVector(history.names,pendingList(await t.list(state.key))))throw Error('Journal changed while checking version');
       v.savedSig=sig;versionReport(id,v,'Independent archive: verified existing version · '+(file.size/1048576).toFixed(2)+' MiB');return;
     }
-    if(names.length>=versionCapability.maxVersions){v.limit=true;throw Error('Pilot limit reached (5 versions per device/deck); all existing versions preserved');}
+    if(names.length>=versionCapability.maxVersions&&versionCapability.retention!=='local-backup-v1'){v.limit=true;throw Error('Version limit reached; update native bridge for verified local retention. All existing versions preserved');}
     if(!stable())throw Error('New edits arrived before version build');
     versionReport(id,v,'Independent archive: building verified version…');
     const built=await saveAllDecksToFile(id,{buildOnly:true,exportFilename:name,journalHistory:{manifest:history.manifest,events:history.events,seen:history.seen}});
@@ -12851,32 +12861,32 @@ async function publishVersion(id,v){
     // Text-only or small decks may not benefit from compaction. Preserve their full package.
     await AnkiSyncCompact.compact(zip);
     const output=await zip.generateAsync({type:'blob',compression:'DEFLATE',compressionOptions:{level:3}});
-    if(output.size>versionCapability.maxBytes)throw Error('Archive exceeds 64 MiB pilot limit');
+    if(output.size>versionCapability.maxBytes)throw Error('Archive exceeds 64 MiB limit');
     const expanded=await ankiValidateZipBlob(output);await verifyVersionZip(expanded,id,deck,state,local,history,name,checkpoint);
     const digest=await archiveSHA(output);
     if(!stable()||!archiveVector(history.names,pendingList(await t.list(state.key))))throw Error('Journal changed before version write');
     const result=await native.versionWrite(state.key,state.device,checkpoint,digest,output);
-    if(result?.sha256!==digest||result?.name!==prefix+digest+'.apkg'||result?.size!==output.size)throw Error('Native version readback verification failed');
+    if(result?.sha256!==digest||result?.name!==prefix+digest+'.apkg'||result?.size!==output.size)throw Error('Version readback verification failed');
     v.lastWrite=Date.now();const afterWrite=await t.list(state.key);if(stable()&&archiveVector(history.names,pendingList(afterWrite))){v.savedSig=sig;setCopy(id,sig,'ok','Independent archive matches local journal','New version saved and SHA-256 verified on this device · original named archive may still be older',COPY_RECHECK);}
-    versionReport(id,v,'Independent archive: saved and SHA-256 verified · '+(output.size/1048576).toFixed(2)+' MiB · '+new Date().toLocaleTimeString());
+    versionReport(id,v,'Independent archive: saved and SHA-256 verified · '+(output.size/1048576).toFixed(2)+' MiB · '+new Date().toLocaleTimeString()+(result.retired?' · '+result.retired+' older version(s) backed up locally':'')+(result.retirementWarning?' · retirement pending: '+result.retirementWarning:''));
   }catch(e){versionReport(id,v,'Independent archive: held safely · '+String(e?.message||e));console.warn('Archive version:',e);}
   finally{versionJob=null;}
 }
 function tickVersion(){
-  if(!root.AnkiNative?.available||!stateReady()||document.visibilityState!=='visible')return;
-  if(versionCapability===null&&!versionCapabilityBusy){versionCapabilityBusy=true;root.AnkiNative.versionCapabilities().then(c=>{versionCapability=c?.format===1&&c.maxBytes===64*1024*1024&&c.maxVersions===5?c:false;}).catch(()=>{versionCapability=false;}).finally(()=>{versionCapabilityBusy=false;});return;}
+  const writer=versionWriter();if(!writer||!stateReady()||document.visibilityState!=='visible')return;
+  if(!versionCapability&&!versionCapabilityBusy&&Date.now()>=versionCapabilityRetry){versionCapabilityBusy=true;versionCapabilityRetry=Date.now()+60000;writer.versionCapabilities().then(c=>{versionCapability=c?.format===1&&c.maxBytes===64*1024*1024&&c.maxVersions===5?c:null;}).catch(()=>{versionCapability=null;}).finally(()=>{versionCapabilityBusy=false;});return;}
   if(!versionCapability||versionJob||copyJob||archiveBusy.size||recoveryJobs.size||document.getElementById('view-decks')?.classList.contains('hidden')||document.getElementById('studyEditMode')?.offsetParent||document.getElementById('quickAddModal')?.offsetParent)return;
-  const now=Date.now();for(const [id,deck] of Object.entries(appState.decks)){
+  const now=Date.now(),entries=Object.entries(appState.decks);for(let i=0;i<entries.length;i++){const index=(versionCursor+i)%entries.length,[id,deck]=entries[index];
     if(!versionPilotEnabled(id))continue;
     let v=versionStates.get(id);if(!v){v={sig:null,since:now,next:0,lastWrite:0};versionStates.set(id,v);}
-    if(!copyClean(id,deck)||!deck.cards?.length||!validArchiveName(deck.sourceFileName)){v.sig=null;v.since=now;continue;}
+    if(!copyClean(id,deck)||!deck.cards?.length||!versionSourceOK(deck)){v.sig=null;v.since=now;continue;}
     const sig=copySig(deck);if(v.sig!==sig){v.sig=sig;v.since=now;v.next=0;v.limit=false;versionReport(id,v,'Independent archive: waiting for stable checkpoint');}
     if(v.savedSig===sig&&copyPresentation(id).level==='ok')continue;
     if(v.limit||!versionAllowed(id,deck))continue;
     const delay=Math.max(v.since+VERSION_QUIET,v.next,(v.lastWrite||0)+VERSION_MIN_GAP)-now;
     if(delay>0){versionReport(id,v,'Independent archive: next check in '+Math.ceil(delay/1000)+'s');continue;}
     if(copyPresentation(id).level==='ok'){versionReport(id,v,'Independent archive: current archive verified; no extra version needed');v.next=now+30000;continue;}
-    void publishVersion(id,v);break;
+    versionCursor=(index+1)%entries.length;void publishVersion(id,v);break;
   }
 }
 function archiveLabel(id){return archiveReports.get(String(id))||'Archive publisher: designated desktop';}
@@ -13031,7 +13041,7 @@ async function recoverMissingManifest(t,key,id){
 }
 async function publishArchive(id,manual=false){
   id=String(id);if(!root.AnkiPCBridge?.hybridPublisher||(id===STAR&&!root.AnkiPCBridge?.starredPublisher)){if(manual)archiveReport(id,'Archive is published only on the designated desktop with compatible bridge');return;}
-  if(archiveBusy.has(id)||jobs.has(id)||(!manual&&(archiveRetry.get(id)||0)>Date.now()))return;
+  if(versionJob||archiveBusy.size||jobs.has(id)||(!manual&&(archiveRetry.get(id)||0)>Date.now()))return;
   const deck=appState?.decks?.[id],state=deck?.ankiJournal;
   if(!state?.enabled||state.conflict||state.pendingEvent||deck.ankiPendingFileRename||!/^Up To Date/.test(label(id)))return;
   archiveBusy.add(id);archiveRetry.set(id,Date.now()+ARCHIVE_RETRY_MS);
