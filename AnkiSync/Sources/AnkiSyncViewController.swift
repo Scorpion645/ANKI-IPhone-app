@@ -48,6 +48,19 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
     }
     private var pendingJournalWrites: [String: PendingJournalWrite] = [:]
     private let maxJournalBytes = 64 * 1024 * 1024
+    // Version pilot: isolated, immutable archives; never use linked-file writes.
+    private let maxVersionBytes = 64 * 1024 * 1024
+    private let maxVersionsPerDeviceDeck = 5
+    private struct PendingVersion {
+        let key: String
+        let device: String
+        let checkpoint: String
+        let digest: String
+        let size: Int
+        var bytes = Data()
+    }
+    private var pendingVersion: (id: String, request: PendingVersion)?
+    private var versionCommitBusy = false
 
 
     override func viewDidLoad() {
@@ -227,6 +240,65 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
             reply(id, data: ["connected": permitted,
                              "folder": permitted ? (folder?.lastPathComponent ?? "") : "",
                              "links": permitted ? loadLinks() : [:]])
+        case "versionCapabilities":
+            reply(id, data: ["format":1,"maxBytes":maxVersionBytes,"maxVersions":maxVersionsPerDeviceDeck])
+        case "versionList":
+            guard let key = obj["key"] as? String, let device = obj["device"] as? String else {
+                reply(id, error: "Missing version identity"); return
+            }
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { return }
+                do { let names = try self.listVersions(key: key, device: device)
+                    DispatchQueue.main.async { self.reply(id, data: names) }
+                } catch { DispatchQueue.main.async { self.reply(id, error: error.localizedDescription) } }
+            }
+        case "versionRead":
+            guard let key = obj["key"] as? String, let device = obj["device"] as? String,
+                  let name = obj["name"] as? String, self.validVersionName(name) else {
+                reply(id, error: "Invalid version path"); return
+            }
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { return }
+                do { let bytes = try self.readVersion(key: key, device: device, name: name)
+                    DispatchQueue.main.async { self.transferFile(id: id, name: name, data: bytes) }
+                } catch { DispatchQueue.main.async { self.reply(id, error: error.localizedDescription) } }
+            }
+        case "versionBegin":
+            guard let key = obj["key"] as? String, let device = obj["device"] as? String,
+                  let checkpoint = obj["checkpoint"] as? String, let digest = obj["sha256"] as? String,
+                  let transferId = obj["transferId"] as? String, let size = obj["size"] as? Int,
+                  size >= 100 && size <= maxVersionBytes,
+                  pendingVersion == nil, !versionCommitBusy,
+                  validVersionIdentity(key: key, device: device), validVersionDigest(checkpoint), validVersionDigest(digest) else {
+                reply(id, error: "Version transfer busy, invalid, or exceeds 64 MiB"); return
+            }
+            pendingVersion = (transferId, PendingVersion(key: key, device: device, checkpoint: checkpoint, digest: digest, size: size))
+            reply(id, data: ["ready":true])
+        case "versionChunk":
+            guard let transferId = obj["transferId"] as? String, var pending = pendingVersion,
+                  pending.id == transferId, let encoded = obj["data"] as? String,
+                  let bytes = Data(base64Encoded: encoded), !bytes.isEmpty, bytes.count <= chunkLength,
+                  pending.request.bytes.count + bytes.count <= pending.request.size else {
+                reply(id, error: "Invalid version chunk; no archive modified"); return
+            }
+            pendingVersion = nil
+            pending.request.bytes.append(bytes); pendingVersion = pending
+            reply(id, data: ["received":pending.request.bytes.count])
+        case "versionAbort":
+            if let transferId = obj["transferId"] as? String, pendingVersion?.id == transferId { pendingVersion = nil }
+            reply(id, data: ["aborted":true])
+        case "versionCommit":
+            guard let transferId = obj["transferId"] as? String, let pending = pendingVersion,
+                  pending.id == transferId, pending.request.bytes.count == pending.request.size, !versionCommitBusy else {
+                reply(id, error: "Incomplete version transfer; no archive modified"); return
+            }
+            pendingVersion = nil; versionCommitBusy = true
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { return }
+                do { let result = try self.writeVersion(pending.request)
+                    DispatchQueue.main.async { self.versionCommitBusy = false; self.reply(id, data: result) }
+                } catch { DispatchQueue.main.async { self.versionCommitBusy = false; self.reply(id, error: error.localizedDescription) } }
+            }
         case "journalList":
             guard let key = obj["key"] as? String else { reply(id, error: "Missing journal key"); return }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -586,6 +658,11 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
                 guard let enumerator = FileManager.default.enumerator(at: url,
                     includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else { return }
                 for case let file as URL in enumerator {
+                    // Recovery versions must never be offered as linked originals.
+                    let relative = String(file.standardizedFileURL.path.dropFirst(url.standardizedFileURL.path.count + 1))
+                    if relative == "AnkiSync-Archive-Versions" || relative.hasPrefix("AnkiSync-Archive-Versions/") {
+                        enumerator.skipDescendants(); continue
+                    }
                     guard ["apkg", "colpkg"].contains(file.pathExtension.lowercased()) else { continue }
                     let full = file.standardizedFileURL.path
                     let base = url.standardizedFileURL.path + "/"
@@ -684,6 +761,88 @@ final class AnkiSyncViewController: UIViewController, WKScriptMessageHandler,
             let verified = try readJournal(key: request.key, name: request.name)
             guard hash(verified) == digest else { throw NativeError("Journal write verification failed. Sync stopped.") }
             return ["saved":true,"sha256":digest]
+        }
+    }
+
+    // These paths are strictly constructed from journal/device IDs and hashes.
+    private func validVersionIdentity(key: String, device: String) -> Bool {
+        key.range(of: "^deck-[a-f0-9]{16}$", options: .regularExpression) != nil &&
+        device.range(of: "^device-[a-f0-9]{32}$", options: .regularExpression) != nil
+    }
+    private func validVersionDigest(_ value: String) -> Bool {
+        value.count == 64 && value.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil
+    }
+    private func validVersionName(_ name: String) -> Bool {
+        name.range(of: "^checkpoint-[a-f0-9]{64}-[a-f0-9]{64}\\.apkg$", options: .regularExpression) != nil && name.count == 145
+    }
+    private func versionDirectory(_ root: URL, key: String, device: String) throws -> URL {
+        guard validVersionIdentity(key: key, device: device) else { throw NativeError("Invalid version identity") }
+        let base = root.standardizedFileURL.resolvingSymlinksInPath()
+        let dir = base.appendingPathComponent("AnkiSync-Archive-Versions", isDirectory: true)
+            .appendingPathComponent(key, isDirectory: true).appendingPathComponent(device, isDirectory: true)
+        guard dir.resolvingSymlinksInPath().path == dir.path else { throw NativeError("Version directory is a symbolic link") }
+        return dir
+    }
+    private func listVersions(key: String, device: String) throws -> [String] {
+        try withFolder { root in
+            let dir = try versionDirectory(root, key: key, device: device)
+            if !FileManager.default.fileExists(atPath: dir.path) { return [] }
+            var names: [String] = []; var failure: Error?; var coordinationError: NSError?
+            NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: dir, options: [], error: &coordinationError) { url in
+                do { names = try FileManager.default.contentsOfDirectory(atPath: url.path).filter(self.validVersionName).sorted() }
+                catch { failure = error }
+            }
+            if let error = coordinationError { throw error }; if let error = failure { throw error }
+            return names
+        }
+    }
+    private func readVersionAt(_ url: URL, digest: String) throws -> Data {
+        guard url.resolvingSymlinksInPath().path == url.standardizedFileURL.path else { throw NativeError("Version file is a symbolic link") }
+        let size = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+        guard size.isRegularFile == true, let n = size.fileSize, n >= 100, n <= maxVersionBytes else { throw NativeError("Version unavailable or exceeds limit") }
+        let data = try coordinatedRead(url)
+        guard data.count == n, data.count <= maxVersionBytes, hash(data) == digest else { throw NativeError("Version checksum mismatch") }
+        return data
+    }
+    private func readVersion(key: String, device: String, name: String) throws -> Data {
+        guard validVersionName(name) else { throw NativeError("Invalid archive version name") }
+        let digest = String(name.dropLast(5).suffix(64))
+        return try withFolder { root in
+            let dir = try versionDirectory(root, key: key, device: device)
+            return try readVersionAt(dir.appendingPathComponent(name), digest: digest)
+        }
+    }
+    private func writeVersion(_ request: PendingVersion) throws -> [String: Any] {
+        guard validVersionIdentity(key: request.key, device: request.device), validVersionDigest(request.checkpoint),
+              validVersionDigest(request.digest), request.bytes.count == request.size, request.size <= maxVersionBytes,
+              request.size >= 100, request.bytes.prefix(4) == Data([0x50,0x4b,0x03,0x04]),
+              hash(request.bytes) == request.digest else { throw NativeError("Invalid version bytes or SHA-256") }
+        let name = "checkpoint-" + request.checkpoint + "-" + request.digest + ".apkg"
+        guard validVersionName(name) else { throw NativeError("Invalid version filename") }
+        return try withFolder { root in
+            let dir = try versionDirectory(root, key: request.key, device: request.device)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            var coordinateError: NSError?; var failure: Error?
+            NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: dir, options: .forMerging, error: &coordinateError) { targetDir in
+                do {
+                    let target = targetDir.appendingPathComponent(name)
+                    let names = try FileManager.default.contentsOfDirectory(atPath: targetDir.path).filter(self.validVersionName)
+                    if names.contains(name) { return } // verified below; no replacement
+                    guard !names.contains(where: { $0.hasPrefix("checkpoint-" + request.checkpoint + "-") }) else {
+                        throw NativeError("Checkpoint already has another version; verify it before retrying")
+                    }
+                    guard names.count < self.maxVersionsPerDeviceDeck else { throw NativeError("Version pilot limit reached; existing backups kept") }
+                    let temp = targetDir.appendingPathComponent(".ankisync-version-" + UUID().uuidString + ".tmp")
+                    defer { try? FileManager.default.removeItem(at: temp) }
+                    try request.bytes.write(to: temp, options: .atomic)
+                    guard !FileManager.default.fileExists(atPath: target.path) else { throw NativeError("Version already appeared; retry verification") }
+                    try FileManager.default.moveItem(at: temp, to: target)
+                } catch { failure = error }
+            }
+            if let error = coordinateError { throw error }; if let error = failure { throw error }
+            let verified = try readVersionAt(dir.appendingPathComponent(name), digest: request.digest)
+            guard verified.count == request.size else { throw NativeError("Version readback length differs") }
+            return ["saved":true,"name":name,"sha256":request.digest,"size":verified.count]
         }
     }
 

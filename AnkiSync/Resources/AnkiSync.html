@@ -14,9 +14,15 @@
   function call(action,extra={}) {
     const id='native_'+(++counter);
     return new Promise((resolve,reject)=>{
-      pending.set(id,{resolve,reject,chunks:[],received:0,name:''});
+      let timeout=null;
+      const settle=fn=>value=>{if(timeout!==null)clearTimeout(timeout);fn(value);};
+      pending.set(id,{resolve:settle(resolve),reject:settle(reject),chunks:[],received:0,name:''});
+      if(/^journal/.test(action)||action==='status')timeout=setTimeout(()=>{
+        const item=pending.get(id);if(!item)return;pending.delete(id);item.reject(new Error('iCloud response timed out; will retry when available.'));
+      },action==='journalRead'||action==='journalCommit'?180000:60000);
       try{channel.postMessage({id,action,...extra});}
-      catch(err){pending.delete(id);reject(err);}
+      catch(err){const item=pending.get(id);pending.delete(id);item?.reject(err);}
+
     });
   }
   const native={
@@ -102,6 +108,19 @@
       }
       return await call('journalCommit',{transferId});
     }catch(err){void call('journalAbort',{transferId}).catch(()=>{});throw err;}
+  };
+  // Separate, create-only native archive version transport. No original links.
+  native.versionCapabilities=()=>call('versionCapabilities');
+  native.versionList=(key,device)=>call('versionList',{key,device});
+  native.versionRead=(key,device,name)=>call('versionRead',{key,device,name});
+  native.versionWrite=async function(key,device,checkpoint,sha256,blob){
+    const raw=new Uint8Array(await blob.arrayBuffer()),transferId='version_'+(++counter)+'_'+Date.now();
+    try{
+      await call('versionBegin',{key,device,checkpoint,sha256,size:raw.length,transferId});
+      for(let i=0;i<raw.length;i+=48*1024){let binary='';for(const byte of raw.subarray(i,i+48*1024))binary+=String.fromCharCode(byte);
+        await call('versionChunk',{transferId,data:btoa(binary)});}
+      return await call('versionCommit',{transferId});
+    }catch(e){void call('versionAbort',{transferId}).catch(()=>{});throw e;}
   };
   const nativeLinks = new Map();
   const nativeTimers = new Map();
@@ -280,7 +299,7 @@
     }
   };
   native.saveDeck=async function(deckId,manual=true){
-    if(window.AnkiSyncJournal?.enabled(deckId)) {if(manual)alert('Change journal is active. Use Save As to export a separate .apkg backup. The original archive is not overwritten.');return;}
+    if(window.AnkiSyncJournal?.enabled(deckId)||(!manual&&window.AnkiSyncJournal&&window.AnkiNative?.available)) {if(manual)alert('Change journal is active. Use Save As to export a separate .apkg backup. The original archive is not overwritten.');return;}
     if(window.AnkiSyncAuto?.enabledFor(deckId) && !window.AnkiSyncAuto.isCommitting)
       return window.AnkiSyncAuto.syncNow(deckId,manual);
     const e=nativeLinks.get(deckId),deck=appState.decks?.[deckId];
@@ -467,7 +486,7 @@
 </script>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover" />
-  <title>Anki Sync & Reader with IndexedDB Storage</title>
+  <title>AnkiSync — Archive Checkpoint Verification</title>
   
   <!-- CSS Frameworks & Icons -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -1819,13 +1838,16 @@ body.light-mode .anki-deck-tile .anki-legacy-details { color:#334155; }
 body.light-mode .anki-card-review-meta { color: #64748b; }
 
 
-/* Small review timestamps anchored to the front face, clear of the study buttons. */
-#studyCard #ankiCardReviewMeta {
+/* Metadata belongs to each physical card face. The front and back have
+   separate readable copies, each rotating naturally with its own face.
+   It never floats outside the card or overlaps the bottom action buttons. */
+#studyCard #ankiCardReviewMetaFront,
+#studyCard #ankiCardReviewMetaBack {
   position: absolute;
-  right: 13px;
-  bottom: 59px;
-  width: min(94%, 560px);
-  max-width: calc(100% - 26px);
+  left: 12px;
+  right: 12px;
+  bottom: 11px;
+  width: auto;
   margin: 0;
   padding: 0;
   text-align: right;
@@ -1833,9 +1855,14 @@ body.light-mode .anki-card-review-meta { color: #64748b; }
   line-height: 1.4;
   pointer-events: none;
   z-index: 2;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
 }
+#studyCard #cardFront { padding-bottom: 22px; }
+#studyCard #cardBack { padding-bottom: 30px; }
 @media (max-width:700px) {
-  #studyCard #ankiCardReviewMeta { bottom: 56px; right: 10px; font-size: 9px; }
+  #studyCard #ankiCardReviewMetaFront,
+  #studyCard #ankiCardReviewMetaBack { left: 9px; right: 9px; bottom: 9px; font-size: 9px; }
 }
 /* Preserve all existing toolbar functions, but expose saving through one
    floating button when the new control has initialized. */
@@ -1907,13 +1934,143 @@ body.anki-floating-card-save-ready .anki-toolbar-save { display: none !important
 
 </style>
 
-<style id="ankisync-sync-visibility-v1">
-.anki-sync-display {display:block; padding:9px 11px; border-radius:10px; font-size:13px !important; font-weight:850 !important; line-height:1.35; border:2px solid; letter-spacing:.012em; word-break:break-word;}
-.anki-sync-ok {color:#05ff78 !important; background:rgba(0,130,48,.19); border-color:#00ed69; box-shadow:0 0 0 1px rgba(0,255,99,.17),0 0 14px rgba(0,230,77,.14);}
-.anki-sync-bad {color:#ff5863 !important; background:rgba(210,26,42,.18); border-color:#ff4659; box-shadow:0 0 0 1px rgba(255,60,75,.16),0 0 14px rgba(255,35,65,.12);}
-.anki-sync-checking {color:#ffdd73 !important; background:rgba(198,128,22,.12); border-color:#9c7524;}
-.anki-sync-display::before {content:'●'; display:inline-block; margin-right:8px; font-size:16px; line-height:1; vertical-align:-1px;}
+<style id="ankisync-sync-visibility-v2">
+.anki-sync-display {display:inline-flex; align-items:center; gap:5px; font-size:12px !important; font-weight:700 !important; line-height:1.4; white-space:normal;}
+.anki-sync-ok {color:#05ff78 !important;}
+.anki-sync-bad {color:#ff5863 !important;}
+.anki-sync-checking,.anki-sync-waiting {color:#ffdd73 !important;}
+.anki-sync-off {color:#94a3b8 !important;}
+.anki-sync-display::before {content:'●'; font-size:10px; line-height:1;}
+.anki-sync-technical {overflow-wrap:anywhere; line-height:1.4;}
+body.light-mode .anki-sync-ok {color:#047857 !important;}
+body.light-mode .anki-sync-bad {color:#b91c1c !important;}
+body.light-mode .anki-sync-checking,body.light-mode .anki-sync-waiting {color:#92400e !important;}
+body.light-mode .anki-sync-off {color:#475569 !important;}
+.anki-deck-tile .anki-combined-sync-summary {display:flex;align-items:center;gap:6px;min-height:30px;flex-wrap:wrap;}
+.anki-deck-tile .anki-combined-sync-summary .anki-sync-display {margin-left:auto;}
+.anki-deck-tile .anki-combined-sync-summary::after {float:none;margin-left:2px;flex-shrink:0;}
+
 </style>
+<script id="ankisync-compact-codec">
+/* Compact archive codec v1. Exact UTF-8 metadata reconstruction; no image transcoding. */
+(function(root){
+'use strict';
+const NAME='ankisync-compact-v1.json',NAMES=['ankisync-journal.json','ankisync-linked-state.json'];
+const LIMIT=256*1024*1024, MAX_ITEMS=100000;
+const uri=/data:[a-zA-Z0-9.+/-]+;base64,[A-Za-z0-9+/=]+/g;
+const stub=n=>JSON.stringify({format:'AnkiSyncCompactEntry',version:1,entry:n});
+const enc=new TextEncoder();
+const digest=async raw=>{
+  if(!root.crypto?.subtle)throw Error('Compact archive requires SHA-256 support');
+  return Array.from(new Uint8Array(await root.crypto.subtle.digest('SHA-256',raw)),b=>b.toString(16).padStart(2,'0')).join('');
+};
+async function expand(zip){
+  const packed=zip.file(NAME);
+  if(!packed){for(const n of NAMES){const f=zip.file(n);if(f && f._data?.uncompressedSize<256 && (await f.async('string'))===stub(n))throw Error('Compact archive payload missing');}return zip;}
+  if(packed._data?.uncompressedSize>LIMIT)throw Error('Compact archive exceeds safe read limit');
+  const text=await packed.async('string');
+  if(text.length>LIMIT)throw Error('Compact archive exceeds safe read limit');
+  const p=JSON.parse(text);
+  if(p?.format!=='AnkiSyncCompactArchive'||p.version!==1||!Array.isArray(p.assets)||!Array.isArray(p.entries)||p.entries.length!==NAMES.length||p.assets.length>MAX_ITEMS)throw Error('Unsupported compact archive');
+  if(!p.assets.every(s=>typeof s==='string'&&s.length>0&&/^data:[a-zA-Z0-9.+/-]+;base64,[A-Za-z0-9+/=]+$/.test(s)))throw Error('Invalid compact media asset');
+  const restored=new Map();let total=0;
+  for(const e of p.entries){
+    if(!NAMES.includes(e?.name)||restored.has(e.name)||!Array.isArray(e.parts)||e.parts.length>MAX_ITEMS||!Number.isSafeInteger(e.bytes)||e.bytes<1||e.bytes>LIMIT||!/^[a-f0-9]{64}$/.test(e.sha256))throw Error('Invalid compact entry');
+    const original=zip.file(e.name);
+    if(!original||await original.async('string')!==stub(e.name))throw Error('Compact archive contains missing or conflicting metadata');
+    let length=0;
+    const parts=e.parts.map(v=>{
+      const s=typeof v==='string'?v:Number.isSafeInteger(v)&&v>=0&&v<p.assets.length?p.assets[v]:null;
+      if(s===null||(length+=s.length)>e.bytes)throw Error('Compact entry exceeds declared length or has invalid reference');return s;
+    });
+    total+=e.bytes;if(total>LIMIT)throw Error('Compact archive exceeds expansion limit');
+    const raw=parts.join(''),bytes=enc.encode(raw);
+    if(bytes.length!==e.bytes||await digest(bytes)!==e.sha256)throw Error('Compact archive metadata checksum mismatch');
+    JSON.parse(raw);restored.set(e.name,raw);
+  }
+  for(const [n,raw] of restored)zip.file(n,raw);
+  zip.remove(NAME);return zip;
+}
+async function compact(zip){
+  if(zip.file(NAME))throw Error('Archive must be expanded before compacting');
+  const assets=[],index=new Map(),entries=[];let total=0,duplicated=0;
+  for(const name of NAMES){
+    const f=zip.file(name);if(!f)return false;
+    const text=await f.async('string'),bytes=enc.encode(text);total+=bytes.length;if(total>LIMIT)return false;
+    const parts=[];let pos=0;
+    for(const m of text.matchAll(uri)){
+      if(m[0].length<1024)continue;
+      parts.push(text.slice(pos,m.index));pos=m.index+m[0].length;
+      let i=index.get(m[0]);if(i===undefined){i=assets.length;index.set(m[0],i);assets.push(m[0]);}else duplicated+=m[0].length;
+      parts.push(i);
+    }
+    parts.push(text.slice(pos));if(parts.length>MAX_ITEMS||assets.length>MAX_ITEMS)return false;
+    entries.push({name,bytes:bytes.length,sha256:await digest(bytes),parts});
+  }
+  if(duplicated<65536)return false;
+  zip.file(NAME,JSON.stringify({format:'AnkiSyncCompactArchive',version:1,assets,entries}));
+  for(const n of NAMES)zip.file(n,stub(n));
+  return true;
+}
+async function checkFile(file){
+  const zip=await JSZip.loadAsync(file),isCompact=!!zip.file(NAME);await expand(zip);
+  const required=['collection.anki2','ankisync-progress.json',...NAMES];
+  if(!required.every(n=>zip.file(n)))throw Error('Not a complete AnkiSync journal archive');
+  const read=async n=>JSON.parse(await zip.file(n).async('string'));
+  const [progress,journal,snapshot]=await Promise.all(['ankisync-progress.json',...NAMES].map(read));
+  const count=progress.decks.reduce((n,d)=>n+d.cards.length,0);
+  if(snapshot.cards.length!==count||!journal.history?.manifest)throw Error('Card count or journal baseline mismatch');
+  const a=snapshot.cards.map(c=>String(c.id)).sort(),b=progress.decks.flatMap(d=>d.cards.map(c=>String(c.id))).sort();
+  if(new Set(a).size!==count||JSON.stringify(a)!==JSON.stringify(b))throw Error('Card identity mismatch');
+  return {isCompact,count,reviewed:snapshot.cards.filter(c=>c.reviewData).length,key:journal.history.manifest.key,events:journal.history.events.length};
+}
+root.AnkiSyncCompact=Object.freeze({NAME,expand,compact,checkFile});
+// Keep the checker separate from import; never call handleAnkiFileUpload.
+let checking=false;
+function checkStatus(message,kind='info'){
+  const el=document.getElementById('ankiCompactCheckStatus');
+  if(el){el.textContent=message;el.style.color=kind==='error'?'#ff5863':kind==='ok'?'#22c55e':'';}
+}
+function checkBusy(value){
+  checking=value;
+  for(const id of ['ankiCompactCheckInput','ankiCompactNativeCheck']){
+    const el=document.getElementById(id);if(el)el.disabled=value;
+  }
+}
+async function runCheck(fileProvider,starting){
+  if(checking)return;
+  checkBusy(true);checkStatus(starting);
+  try{
+    const f=await fileProvider();if(!f){checkStatus('No file selected. No decks were modified.');return;}
+    if(!/\.(apkg|colpkg)$/i.test(f.name||''))throw Error('Choose an .apkg or .colpkg file.');
+    checkStatus('Checking '+f.name+' — verifying archive and checksums…');
+    const r=await checkFile(f);
+    checkStatus('Read-only archive check passed\n'+(r.isCompact?'Compact v1':'Legacy format')+'\nCards: '+r.count+'\nReviewed: '+r.reviewed+'\nJournal: '+r.key+'\nEvents: '+r.events+'\nNo decks were imported or modified.','ok');
+  }catch(e){checkStatus('Archive check failed: '+(e?.message||String(e))+'\nNo decks were modified.','error');}
+  finally{checkBusy(false);}
+}
+root.ankiCompactCheckSelected=input=>{
+  const f=input.files?.[0];input.value='';
+  if(f)void runCheck(async()=>f,'Reading selected file…');
+};
+root.ankiCompactNativeCheck=()=>void runCheck(async()=>{
+  if(!root.AnkiNative?.available)throw Error('Native iCloud access is unavailable. Use Choose File above.');
+  const paths=await root.AnkiNative.listFiles();
+  const files=paths.filter(p=>typeof p==='string'&&/\.(apkg|colpkg)$/i.test(p));
+  if(!files.length)throw Error('No archive found in the authorized Anki folder. Use Choose File above.');
+  const answer=prompt('Read-only check — choose an iCloud archive by number:\n\n'+files.map((p,i)=>(i+1)+'. '+p).join('\n'),'');
+  if(answer===null)return null;
+  const n=Number(answer);if(!Number.isInteger(n)||n<1||n>files.length)throw Error('Invalid file number.');
+  checkStatus('Downloading '+files[n-1]+' from iCloud…');
+  return await root.AnkiNative.readFile(files[n-1]);
+},'Listing authorized iCloud archives…');
+root.addEventListener('DOMContentLoaded',()=>{
+  const nativeButton=document.getElementById('ankiCompactNativeCheck');
+  if(nativeButton&&root.AnkiNative?.available)nativeButton.hidden=false;
+});
+})(globalThis);
+
+</script>
 </head>
 <body class="bg-slate-900 text-slate-100 min-h-screen flex flex-col font-sans antialiased selection:bg-indigo-500 selection:text-white">
 
@@ -2138,7 +2295,8 @@ body.anki-floating-card-save-ready .anki-toolbar-save { display: none !important
                   <span id="cardTitleBadge" class="text-[10px] font-bold tracking-wider uppercase text-slate-400 bg-slate-900/80 px-2.5 py-1 rounded-full border border-slate-700">QUESTION</span>
                   <div id="frontContent" dir="auto" class="anki-content text-base md:text-lg text-slate-100 max-w-xl overflow-y-auto max-h-[260px] w-full">
 </div>
-                  <div id="ankiCardReviewMeta" class="anki-card-review-meta" aria-label="Card review history"></div>
+                  <div id="ankiCardReviewMetaFront" class="anki-card-review-meta" aria-label="Card review history"></div>
+
                 </div>
 
                 <!-- Back Side -->
@@ -2146,6 +2304,7 @@ body.anki-floating-card-save-ready .anki-toolbar-save { display: none !important
                   <span class="text-[10px] font-bold tracking-wider uppercase text-indigo-400 bg-indigo-950/80 px-2.5 py-1 rounded-full border border-indigo-800/50">ANSWER</span>
                   <div id="backContent" dir="auto" class="anki-content text-base md:text-lg text-slate-100 max-w-xl overflow-y-auto max-h-[260px] w-full">
 </div>
+                  <div id="ankiCardReviewMetaBack" class="anki-card-review-meta" aria-label="Card review history"></div>
                 </div>
                 
 
@@ -2256,6 +2415,8 @@ body.anki-floating-card-save-ready .anki-toolbar-save { display: none !important
                   <button type="button" onpointerdown="event.preventDefault()" onmousedown="event.preventDefault()" onclick="ankiSelectToSpace('editCardFront',3)" class="toolbar-btn anki-space-select-btn" title="Select from cursor to the third following space" aria-label="Select to space 3">3</button>
                   <button type="button" onpointerdown="event.preventDefault()" onmousedown="event.preventDefault()" onclick="ankiSelectToSpace('editCardFront',4)" class="toolbar-btn anki-space-select-btn" title="Select from cursor to the fourth following space" aria-label="Select to space 4">4</button>
 
+                  <button type="button" onpointerdown="event.preventDefault()" onmousedown="event.preventDefault()" onclick="ankiSelectToBoundary('editCardFront','line')" class="toolbar-btn" title="Select from cursor to the end of the visual line">To Line End</button>
+                  <button type="button" onpointerdown="event.preventDefault()" onmousedown="event.preventDefault()" onclick="ankiSelectToBoundary('editCardFront','paragraph')" class="toolbar-btn" title="Select from cursor to the end of the current paragraph">To Paragraph End</button>
                   <button type="button" onpointerdown="event.preventDefault()" onmousedown="event.preventDefault()" onclick="ankiSelectToNextPunctuation('editCardFront')" class="toolbar-btn" title="Select through next comma, period, semicolon, colon, question mark, or Arabic punctuation" aria-label="Select to next comma, period, semicolon, or Arabic punctuation"><i class="fa-solid fa-i-cursor"></i> To , . ; : ?</button>
                 </div>
                 <button type="button" onmousedown="event.preventDefault()" onclick="insertBackClozeField('editCardFront')" class="toolbar-btn mb-1" title="Convert selected front text to a cloze, or insert a new cloze field"><i class="fa-solid fa-square-plus"></i> Add Cloze Field</button>
@@ -2323,6 +2484,8 @@ body.anki-floating-card-save-ready .anki-toolbar-save { display: none !important
                   <button type="button" onpointerdown="event.preventDefault()" onmousedown="event.preventDefault()" onclick="ankiSelectToSpace('editCardBack',3)" class="toolbar-btn anki-space-select-btn" title="Select from cursor to the third following space" aria-label="Select to space 3">3</button>
                   <button type="button" onpointerdown="event.preventDefault()" onmousedown="event.preventDefault()" onclick="ankiSelectToSpace('editCardBack',4)" class="toolbar-btn anki-space-select-btn" title="Select from cursor to the fourth following space" aria-label="Select to space 4">4</button>
 
+                  <button type="button" onpointerdown="event.preventDefault()" onmousedown="event.preventDefault()" onclick="ankiSelectToBoundary('editCardBack','line')" class="toolbar-btn" title="Select from cursor to the end of the visual line">To Line End</button>
+                  <button type="button" onpointerdown="event.preventDefault()" onmousedown="event.preventDefault()" onclick="ankiSelectToBoundary('editCardBack','paragraph')" class="toolbar-btn" title="Select from cursor to the end of the current paragraph">To Paragraph End</button>
                   <button type="button" onpointerdown="event.preventDefault()" onmousedown="event.preventDefault()" onclick="ankiSelectToNextPunctuation('editCardBack')" class="toolbar-btn" title="Select through next comma, period, semicolon, colon, question mark, or Arabic punctuation" aria-label="Select to next comma, period, semicolon, or Arabic punctuation"><i class="fa-solid fa-i-cursor"></i> To , . ; : ?</button>
                   <button type="button" id="ankiSaveChangesToolbar" onclick="saveCardEdits()" class="anki-toolbar-save px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold shadow-sm transition" title="Save Changes"><i class="fa-solid fa-floppy-disk"></i> Save Changes</button>
                 </div>
@@ -2547,6 +2710,13 @@ body.anki-floating-card-save-ready .anki-toolbar-save { display: none !important
             <p class="text-xs text-slate-500 mt-1">.apkg or .colpkg files</p>
           </div>
 
+          <div id="ankiCompactCheckPanel" class="space-y-2 border border-slate-700 rounded-xl p-3">
+            <label for="ankiCompactCheckInput" class="block text-sm font-semibold text-indigo-300">Check archive format (read only)</label>
+            <p class="text-xs text-slate-400">Choose a test archive below. This does not import or modify decks.</p>
+            <input type="file" id="ankiCompactCheckInput" onchange="ankiCompactCheckSelected(this)" class="block w-full text-sm text-slate-300 file:mr-2 file:rounded-lg file:border-0 file:px-3 file:py-2 file:bg-indigo-600 file:text-white" />
+            <button type="button" id="ankiCompactNativeCheck" hidden onclick="ankiCompactNativeCheck()" class="text-xs text-indigo-300 underline">Check from connected iCloud folder (read only)</button>
+            <p id="ankiCompactCheckStatus" role="status" aria-live="polite" class="text-sm text-slate-300" style="white-space:pre-wrap;overflow-wrap:anywhere">No file selected.</p>
+          </div>
           <div id="importProgress" class="hidden space-y-2">
             <div class="flex justify-between text-xs font-semibold text-slate-400">
               <span id="importStatusText">Parsing Anki Package...</span>
@@ -3490,8 +3660,8 @@ function promptCreateDeck() {
       await ankiRestoreLinkedHandles();
       await ankiRestoreRefreshHandles();
       await ankiStarRestoreExportLink();
-      await ankiRestoreSourceFolder();
-      await ankiLinkFromSourceFolder(false);
+      if(!window.AnkiPCBridge?.hybridPublisher){await ankiRestoreSourceFolder();
+      await ankiLinkFromSourceFolder(false);}
       if(window.AnkiNative?.available) {
         try { await window.AnkiNative.syncLinks(); }
         catch(err) { console.warn('Native iCloud link restore failed:',err); }
@@ -3501,7 +3671,7 @@ function promptCreateDeck() {
       renderCategories();
       renderDecks();
       ankiUpdateSourceFolderStatus();
-      if(ankiMobileSave() || !window.showDirectoryPicker) {
+      if(window.AnkiPCBridge?.hybridPublisher || ankiMobileSave() || !window.showDirectoryPicker) {
         document.querySelectorAll('#ankiSourceFolderPanel button').forEach(button=>button.classList.add('hidden'));
       }
       refreshAnkiImportDeckOptions();
@@ -3897,6 +4067,7 @@ function promptCreateDeck() {
       ankiStarRefreshExportStatus();
     }
     function ankiStarNoticeChange() {
+      if(window.AnkiSyncJournal && (window.AnkiNative?.available||window.AnkiPCBridge?.available))return window.AnkiSyncJournal.dirty(ANKI_STAR_DECK_ID);
       if(window.AnkiSyncJournal?.enabled(ANKI_STAR_DECK_ID))return window.AnkiSyncJournal.dirty(ANKI_STAR_DECK_ID);
       if(window.AnkiSyncAuto?.enabledFor(ANKI_STAR_DECK_ID))return window.AnkiSyncAuto.dirty(ANKI_STAR_DECK_ID);
       if(window.AnkiNative?.available) return window.AnkiNative.markStarChange();
@@ -4366,6 +4537,7 @@ function promptCreateDeck() {
       ankiAutosaveDueAt.delete(deckId);
     }
     function ankiMarkDirty(deckId) {
+      if(window.AnkiSyncJournal && (window.AnkiNative?.available||window.AnkiPCBridge?.available))return window.AnkiSyncJournal.dirty(deckId);
       if(window.AnkiSyncJournal?.enabled(deckId))return window.AnkiSyncJournal.dirty(deckId);
       if(window.AnkiSyncAuto?.enabledFor(deckId))return window.AnkiSyncAuto.dirty(deckId);
       if(window.AnkiNative?.available) return window.AnkiNative.markDirty(deckId);
@@ -4439,6 +4611,15 @@ function promptCreateDeck() {
           !snapshot.cards.every(c=>c && c.id!==undefined && typeof c.front==='string' && typeof c.back==='string' &&
             (!c.reviewData || typeof c.reviewData==='object')))
         throw new Error('The .apkg has AnkiSync saved-state data, but it is invalid or from an unsupported format. Import stopped; original file was not changed.');
+      if(snapshot.portable===true){
+        const entry=zip.file('ankisync-progress.json');
+        const p=entry?JSON.parse(await entry.async('string')):null;
+        const saved=p?.decks?.find(d=>d.name===snapshot.deckName);
+        const a=snapshot.cards.map(c=>String(c.id)).sort(), b=(saved?.cards||[]).map(c=>String(c.id)).sort();
+        if(p?.format!=='AnkiSyncPortableProgress'||p.version!==1||new Set(a).size!==a.length||JSON.stringify(a)!==JSON.stringify(b))
+          throw Error('Portable card snapshot does not match its progress index. Import stopped.');
+        return snapshot;
+      }
       if(snapshot.sourceFileName && snapshot.sourceFileName!==file.name &&
         !confirm('This file contains iPad review progress saved under a different original filename:\n'+
           snapshot.sourceFileName+'\n\nSelected file: '+file.name+'\n\nRestore these saved cards and review stamps anyway?'))
@@ -4448,7 +4629,7 @@ function promptCreateDeck() {
 
     async function ankiValidateZipBlob(file) {
       if(!file || file.size<100) throw new Error('The selected original is empty or too small. It was NOT overwritten.');
-      const zip=await JSZip.loadAsync(file);
+      const zip=await AnkiSyncCompact.expand(await JSZip.loadAsync(file));
       if(!['collection.anki2','collection.anki21','collection.anki21b'].some(n=>zip.file(n)))
         throw new Error('The original is not a valid .apkg containing a collection database. It was NOT overwritten.');
       return zip;
@@ -4685,6 +4866,8 @@ function promptCreateDeck() {
     let ankiSourceFolderHandle=null;
     let ankiSourceFolderHasPermission=false;
     function ankiSourceFolderStatus() {
+      if(window.AnkiPCBridge?.hybridPublisher)return 'iCloud folder: automatic Windows bridge';
+      if(window.AnkiNative?.available)return 'iCloud folder: native app access';
       if(ankiMobileSave() || !window.showDirectoryPicker)
         return 'File permissions are device-specific; iPhone uses Save to Files';
       if(!ankiSourceFolderHandle) return 'Choose your Anki folder once on this computer to recognize deck files automatically';
@@ -4943,8 +5126,7 @@ function promptCreateDeck() {
     }
     async function ankiRefreshDeckFromOriginal(deckId) {
       if(window.AnkiSyncJournal?.enabled(deckId)) {
-        alert('iCloud change journal is active. Use Check Changes, not full .apkg Refresh, to protect review history. Pause the journal and export a backup before re-importing an original archive.');
-        return;
+        return window.AnkiSyncJournal.sync(deckId,false);
       }
       const deck=appState.decks?.[deckId];
       if(!deck) return;
@@ -5406,9 +5588,15 @@ function promptCreateDeck() {
       return saveAllDecksToFile(deckId);
     }
 
+    let ankiManualExportBusy = false;
     async function saveAllDecksToFile(onlyDeckId = null, exportOptions = null) {
+      const manual = !exportOptions?.buildOnly;
+      if (manual && ankiManualExportBusy) { showToast('An export is already in progress.'); return; }
+      if (manual) ankiManualExportBusy = true;
+      let db = null;
       try {
         const buildOnly=!!exportOptions?.buildOnly;
+        const forceDownload=!!exportOptions?.forceDownload;
         const exportDeckEntries = onlyDeckId && ankiIsStarDeck(onlyDeckId)
           ? ankiStarExportGroupedDecks()
           : onlyDeckId
@@ -5422,51 +5610,54 @@ function promptCreateDeck() {
         const isIOSSave = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
           (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
         const defaultExportName = (onlyDeckId
-          ? exportDeckEntries[0][1].name.replace(/[\\/:*?"<>|]/g, '_') + '_'
+          ? exportDeckEntries[0][1].name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').slice(0,160) + '_'
           : 'AnkiSync_Deck_') + Date.now() + '.apkg';
         let exportFilename = buildOnly ? String(exportOptions?.exportFilename || ANKI_STAR_EXPORT_FILENAME) : defaultExportName;
-        let selectedSaveHandle = null;
-        if (buildOnly) {
-          // A caller-supplied verified linked-file writer handles persistence.
-          // Do not ask for a file picker or generate a browser download here.
+        const windowsBridge = !buildOnly && !forceDownload && !isIOSSave &&
+          window.AnkiPCBridge?.nativeSaveAs === true &&
+          location.origin === 'http://127.0.0.1:47621' &&
+          typeof window.__ANKISYNC_LOCAL_BRIDGE_TOKEN__ === 'string';
+        let selectedDirectory = null;
+        if (buildOnly || windowsBridge || forceDownload) {
+          // Build and verify the package BEFORE any Windows destination is opened.
         } else if (isIOSSave) {
           const enteredName = window.prompt('Save As — choose a .apkg file name. After export, choose Save to Files to select a folder.', defaultExportName);
           if (enteredName === null) return;
           const cleanName = enteredName.trim().replace(/[\\/:*?"<>|]/g, '_');
-          if (!cleanName || cleanName === '.apkg') {
-            showToast('Please enter a valid file name.');
-            return;
-          }
+          if (!cleanName || cleanName === '.apkg') throw Error('Please enter a valid file name.');
           exportFilename = /\.apkg$/i.test(cleanName) ? cleanName : cleanName + '.apkg';
-        } else if (window.isSecureContext && 'showSaveFilePicker' in window) {
-          // Choose the destination first: its actual filename must also be
-          // written into the package's internal single-deck metadata.
-          try {
-            selectedSaveHandle = await window.showSaveFilePicker({
-              suggestedName: defaultExportName,
-              types: [{
-                description: 'Anki Package (*.apkg)',
-                accept: { 'application/octet-stream': ['.apkg'] },
-              }],
-            });
-            exportFilename = selectedSaveHandle.name || defaultExportName;
-          } catch (err) {
-            if (err.name === 'AbortError') return;
-            console.warn('Save picker unavailable; using browser download:', err);
+        } else if (window.isSecureContext && typeof window.showDirectoryPicker === 'function') {
+          // Directory selection is non-destructive. Never use showSaveFilePicker
+          // here: some implementations create/truncate a destination on selection.
+          try { selectedDirectory = await window.showDirectoryPicker({mode:'readwrite',id:'ankisync-backup-folder'}); }
+          catch (err) {
+            console.warn('Save As folder picker:',err);
+            if (err?.name === 'AbortError') { showToast('Save As canceled or folder blocked.'); return; }
+            throw Error('Cannot open folder picker: '+(err?.message||err));
           }
+          const entered = window.prompt('Enter a NEW backup filename in the selected folder:',defaultExportName);
+          if (entered === null) { showToast('Save As canceled.'); return; }
+          exportFilename = entered.trim();
+          if (!/\.apkg$/i.test(exportFilename)) exportFilename += '.apkg';
+          if (!/^[^\\/:*?"<>|\x00-\x1f]+\.apkg$/i.test(exportFilename)) throw Error('Invalid .apkg filename.');
+          if (Object.values(appState.decks||{}).some(d=>String(d.sourceFileName||'').toLowerCase()===exportFilename.toLowerCase()))
+            throw Error('Choose a distinct backup filename. This browser cannot verify full original paths.');
+        } else {
+          throw Error('Folder selection unavailable. On Windows, close the old launcher and restart using the updated Python bridge. Alternatively, use Quick Backup.');
         }
+        if (manual) showToast('Preparing and validating .apkg export…');
 
-        // The filename and the internal deck name are separate Anki fields.
-        // For a single-deck export, persist the chosen filename as the deck
-        // name too. Never rename the user's live deck or any cards in memory.
-        // For multi-deck packages retain individual internal deck names.
-        const exportedSingleDeckName = exportDeckEntries.length === 1
-          ? exportFilename.replace(/\.apkg$/i, '').trim()
-          : null;
-        const exportDeckName = (deck) =>
-          exportedSingleDeckName || deck.name || 'Deck';
-        const SQL = await initSqlJs();
-        const db = new SQL.Database();
+        // CRITICAL: a backup filename is NOT a new Anki deck identity.
+        // Preserve internal deck names when a timestamped Save As copy is made.
+        // Otherwise a new device may interpret the backup as a new journal.
+        const exportDeckName = (deck) => deck.name || 'Deck';
+        if (typeof initSqlJs !== 'function' || typeof JSZip === 'undefined')
+          throw Error('SQLite or ZIP library did not load. Check internet access and reload AnkiSync.');
+        let sqlTimeout;
+        const SQL = await Promise.race([initSqlJs(),new Promise((_,reject)=>{
+          sqlTimeout=setTimeout(()=>reject(Error('SQLite initialization timed out. Reload AnkiSync and try again.')),30000);
+        })]).finally(()=>clearTimeout(sqlTimeout));
+        db = new SQL.Database();
 
         db.run(`CREATE TABLE col (id integer primary key, crt integer, mod integer, scm integer, ver integer, dty integer, usn integer, ls integer, conf text, models text, decks text, dconf text, tags text);`);
         db.run(`CREATE TABLE notes (id integer primary key, guid text, mid integer, mod integer, usn integer, tags text, flds text, sfld text, csum integer, flags integer, data text);`);
@@ -5503,6 +5694,7 @@ function promptCreateDeck() {
         let deckIdCounter = 1;
         let noteIdCounter = Date.now();
         let cardIdCounter = Date.now() + 100000;
+        const usedRevlogIds = new Set();
         const modelId = 1600000000000;
         let mediaMap = {};
         let mediaCounter = { val: 0 };
@@ -5583,7 +5775,11 @@ function promptCreateDeck() {
               if (reviewData && reviewData.lastReviewedAt) {
                 const ratingToEase = { Again: 1, Hard: 2, Good: 3, Easy: 4, Week: 4 };
                 const ease = ratingToEase[reviewData.lastRating] || 3;
-                const revlogId = Math.max(1, Number(reviewData.lastReviewedAt) || nowMs) + cIdx;
+                const stamp = Number(reviewData.lastReviewedAt);
+                let revlogId = Number.isSafeInteger(stamp) && stamp > 0 ? stamp : nowMs;
+                if (revlogId >= Number.MAX_SAFE_INTEGER - 1000000) revlogId = nowMs;
+                while (usedRevlogIds.has(revlogId)) revlogId++;
+                usedRevlogIds.add(revlogId);
                 db.run(`INSERT INTO revlog VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`, [
                   revlogId, cid, -1, ease, intervalDays || 0, 0, factor, 0, intervalDays ? 1 : 0
                 ]);
@@ -5657,7 +5853,11 @@ function promptCreateDeck() {
           "{}"
         ];
         db.run(`INSERT INTO col VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`, colRow);
+        const expectedSQLCount = exportDeckEntries.reduce((sum,[,d])=>sum+(d.cards||[]).length,0);
+        const sqlCount = Number(db.exec('SELECT COUNT(*) FROM cards')[0]?.values?.[0]?.[0]);
+        if (sqlCount !== expectedSQLCount) throw Error('SQLite export card count mismatch.');
         const binaryArray = db.export();
+        db.close(); db=null;
         zip.file("collection.anki2", binaryArray);
         zip.file("media", JSON.stringify(mediaMap));
 
@@ -5669,8 +5869,14 @@ function promptCreateDeck() {
           format: 'AnkiSyncPortableProgress',
           version: 1,
           exportedAt: new Date().toISOString(),
-          decks: exportDeckEntries.map(([, deck]) => ({
+          decks: exportDeckEntries.map(([entryId, deck]) => ({
             name: exportDeckName(deck),
+            sourceIdentity: {
+              originalFile: String(deck.sourceFileName||''),
+              journalSource: String(deck.ankiJournalSource||deck.sourceFileName||deck.name||''),
+              journalKey: window.AnkiSyncJournal?.portableIdentity(onlyDeckId&&ankiIsStarDeck(onlyDeckId)?onlyDeckId:entryId)?.key || null,
+              checkpoint: window.AnkiSyncJournal?.portableIdentity(onlyDeckId&&ankiIsStarDeck(onlyDeckId)?onlyDeckId:entryId)?.checkpoint || null
+            },
             lastIndex: Number(deck.lastIndex) || 0,
             lastCardId: deck.lastCardId || null,
             cards: (deck.cards || []).map(card => ({
@@ -5684,16 +5890,65 @@ function promptCreateDeck() {
           }))
         };
         zip.file('ankisync-progress.json', JSON.stringify(portableProgress));
+        const logicalIdentities=onlyDeckId&&ankiIsStarDeck(onlyDeckId)&&exportOptions?.journalHistory?[{name:appState.decks[onlyDeckId].name,
+          originalFile:String(appState.decks[onlyDeckId].sourceFileName||''),journalSource:String(appState.decks[onlyDeckId].ankiJournalSource||''),
+          journalKey:window.AnkiSyncJournal?.portableIdentity(onlyDeckId)?.key||null,
+          checkpoint:window.AnkiSyncJournal?.portableIdentity(onlyDeckId)?.checkpoint||null}]:portableProgress.decks.map(d=>({name:d.name,...d.sourceIdentity}));
+        zip.file('ankisync-identity.json', JSON.stringify({format:'AnkiSyncIdentity',version:1,decks:logicalIdentities}));
+        const embeddedJournal={format:'AnkiSyncEmbeddedJournal',version:1,createdAt:portableProgress.exportedAt,
+          decks:logicalIdentities,
+          ...(exportOptions?.journalHistory?{history:exportOptions.journalHistory}:{})};
+        zip.file('ankisync-journal.json',JSON.stringify(embeddedJournal));
+        // A single ordinary deck can carry its exact original card fields too.
+        // This prevents media/text reconstruction from changing journal fingerprints.
+        if(exportDeckEntries.length===1 && !(onlyDeckId&&ankiIsStarDeck(onlyDeckId)) && !ankiIsStarDeck(exportDeckEntries[0][0])){
+          const d=exportDeckEntries[0][1];
+          if(d.cards?.length)zip.file('ankisync-linked-state.json',JSON.stringify({
+            format:'AnkiSyncLinkedDeckState',version:1,portable:true,
+            sourceFileName:exportFilename,deckName:exportDeckName(d),category:d.category,
+            lastIndex:d.lastIndex||0,lastCardId:d.lastCardId||null,
+            exportedAt:portableProgress.exportedAt,cards:d.cards}));
+        }
+
         if(onlyDeckId && ankiIsStarDeck(onlyDeckId)) {
           const marker=exportOptions?.starManifest ||
             ankiStarManifest(ankiStarContentDigest(),Date.now()+'-manual');
           zip.file('ankisync-starred-links.json',JSON.stringify(marker));
+          const starSnapshot=ankiLinkedStateSnapshot(onlyDeckId);
+          if(exportOptions?.journalHistory&&starSnapshot.cards.length)zip.file('ankisync-linked-state.json',JSON.stringify({...starSnapshot,sourceFileName:exportFilename,saveToken:marker.saveToken}));
         }
 
 const content = await zip.generateAsync({ type: "blob" });
+        // Verify that the export actually contains all currently loaded cards.
+        // This catches incomplete exports before Windows shows success.
+        if(content.size<100)throw new Error('Generated .apkg is empty.');
+        const checkedZip=await ankiValidateZipBlob(content);
+        const checkedManifest=JSON.parse(await checkedZip.file('ankisync-progress.json').async('string'));
+        const expectedCount=exportDeckEntries.reduce((sum,[,d])=>sum+(d.cards||[]).length,0);
+        const actualCount=(checkedManifest.decks||[]).reduce((sum,d)=>sum+(d.cards||[]).length,0);
+        if(expectedCount!==actualCount)throw new Error('Export card count mismatch: expected '+expectedCount+', package contains '+actualCount+'. No file written.');
         if(buildOnly) return {blob:content,filename:exportFilename};
 
-        if (isIOSSave) {
+        if (windowsBridge) {
+          showToast('Package verified. Windows Save As dialog is opening…');
+          const response = await fetch('/__ankisync/save-as?name='+encodeURIComponent(exportFilename),{
+            method:'POST',cache:'no-store',credentials:'same-origin',
+            headers:{'X-AnkiSync-Bridge-Token':window.__ANKISYNC_LOCAL_BRIDGE_TOKEN__,
+              'Content-Type':'application/octet-stream','X-AnkiSync-Card-Count':String(actualCount)},
+            body:content
+          });
+          let result;
+          try { result=await response.json(); } catch (_) { throw Error('Unexpected response from the Windows bridge. Restart the updated launcher.'); }
+          if (!response.ok) throw Error(result.error||('Windows bridge error '+response.status));
+          if (result.canceled) { showToast('Save As canceled; no file was written.'); return; }
+          if (!result.saved || result.size !== content.size || result.cards !== actualCount)
+            throw Error('Windows bridge could not verify the saved file. Check the selected folder.');
+          showToast('Save As verified: '+actualCount+' cards.');
+          alert('Save As complete!\n\nFile: '+result.path+'\nCards: '+actualCount+'\n\nYour shared original was not overwritten.');
+          return;
+        }
+
+        if (isIOSSave && !forceDownload) {
           // Installed AnkiSync: UIKit document export picker lets the user
           // choose the destination. Do not silently save into Downloads.
           if (window.AnkiNative?.available && typeof window.AnkiNative.exportApkg === 'function') {
@@ -5740,33 +5995,26 @@ const content = await zip.generateAsync({ type: "blob" });
           return;
         }
         
-        // Manual Save As: validate the generated .apkg BEFORE requesting a writer.
-        // On failure, never silently download a second copy and claim success.
-        if (selectedSaveHandle) {
-          let writable=null;
+        if (selectedDirectory) {
+          // Existing files are deliberately not replaceable in the browser-only
+          // fallback (no full paths or atomic create-only browser primitive).
           try {
-            await ankiValidateZipBlob(content);
-            const original=await selectedSaveHandle.getFile();
-            if(original.size>0) {
-              await ankiValidateZipBlob(original);
-              // Keep a recoverable pre-overwrite archive when an imported deck is known.
-              if(onlyDeckId) await ankiBackupOriginalOnce(onlyDeckId,original);
-            }
-            writable=await selectedSaveHandle.createWritable({keepExistingData:true,mode:'exclusive'});
-            await writable.write({type:'write',position:0,data:content});
-            await writable.truncate(content.size);
-            await writable.close(); writable=null;
-            const saved=await selectedSaveHandle.getFile();
-            if(saved.size!==content.size) throw new Error('Saved package size mismatch. Check recovery copy before proceeding.');
+            await selectedDirectory.getFileHandle(exportFilename);
+            throw Error('That filename already exists. Choose a new backup name.');
+          } catch (err) { if (err?.name !== 'NotFoundError') throw err; }
+          const handle = await selectedDirectory.getFileHandle(exportFilename,{create:true});
+          let writable;
+          try {
+            const before=await handle.getFile();
+            if(before.size!==0) throw Error('Destination appeared during export; no overwrite.');
+            writable=await handle.createWritable();
+            await writable.write(content); await writable.close(); writable=null;
+            const saved=await handle.getFile();
+            if(saved.size!==content.size) throw Error('Saved package size mismatch.');
             await ankiValidateZipBlob(saved);
-            showToast('Deck exported and verified!');
-            return;
-          } catch (err) {
-            if(writable) try {await writable.abort();}catch(_){}
-            console.error('Manual APKG save failed:',err);
-            alert('Save As did not finish safely: '+(err?.message||err)+'\nBrowser-stored cards remain intact.');
-            return;
-          }
+            alert('Save As complete!\n'+exportFilename+'\nCards: '+actualCount);
+          } catch(err) { if(writable) try{await writable.abort();}catch(_){} throw err; }
+          return;
         }
 
         // Fallback: Creates a direct download link without the generic popup prompt
@@ -5777,13 +6025,18 @@ const content = await zip.generateAsync({ type: "blob" });
         document.body.appendChild(downloadAnchor);
         downloadAnchor.click();
         downloadAnchor.remove();
-        showToast("Deck exported successfully!");
+        setTimeout(()=>URL.revokeObjectURL(downloadAnchor.href),60000);
+        showToast('Backup download requested: '+actualCount+' cards. Confirm the file appears in Downloads.');
 
 
 
       } catch(err) {
         console.error("APKG Export Error:", err);
-        alert("APKG Export Error: " + err.message);
+        if (manual) alert('Save As / APKG export failed:\n'+(err?.message||err)+'\n\nYour loaded cards remain in AnkiSync.');
+        else throw err;
+      } finally {
+        if (db) try { db.close(); } catch (_) {}
+        if (manual) ankiManualExportBusy=false;
       }
     }
 
@@ -6487,11 +6740,60 @@ const content = await zip.generateAsync({ type: "blob" });
       renderDecks();
     }
 
+    const ankiOriginalFileMtimeCache=new Map();
+    async function ankiRefreshOriginalFileMtime(deckId, force=false) {
+      const deck=appState.decks?.[deckId];
+      const el=document.getElementById('ankiOriginalMtime-'+String(deckId));
+      if(!deck||!el)return;
+      const name=String(deck.sourceFileName||'');
+      const path=String(deck.sourceFilePath||name).replace(/\\/g,'/');
+      if(!name || !/\.apkg$/i.test(name)) {el.textContent='Original .apkg: no source file linked';return;}
+      if(path.includes('/') && path.split('/').slice(0,-1).some(p=>p && p!=='Anki')) {
+        el.textContent='Original .apkg: located outside main Anki folder';return;
+      }
+      if(!window.AnkiPCBridge?.available || typeof window.__ANKISYNC_LOCAL_BRIDGE_TOKEN__!=='string') {
+        el.textContent='Archive publisher: designated desktop';return;
+      }
+      const prior=ankiOriginalFileMtimeCache.get(deckId);
+      if(!force && prior && prior.name===name && Date.now()-prior.checkedAt<120000) {
+        el.textContent=prior.text;return;
+      }
+      if(el.dataset.busy==='1')return;
+      el.dataset.busy='1';
+      el.textContent='Checking original .apkg modification time…';
+      try {
+        const url='/__ankisync/file-updated?name='+encodeURIComponent(name);
+        const response=await fetch(url,{cache:'no-store',headers:{
+          'X-AnkiSync-Bridge-Token':window.__ANKISYNC_LOCAL_BRIDGE_TOKEN__}});
+        const info=await response.json();
+        if(!response.ok || !Number.isFinite(info?.mtimeMs))throw Error(info?.error||'File timestamp unavailable');
+        const stamp=new Date(info.mtimeMs).toLocaleString([],{
+          month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'});
+        const value='Original .apkg modified: '+stamp;
+        ankiOriginalFileMtimeCache.set(deckId,{name,text:value,checkedAt:Date.now()});
+        if(el.isConnected)el.textContent=value;
+        el.title='File modification time on this PC’s iCloud Drive copy. It is NOT the last journal sync time. Click to check again.';
+      }catch(err) {
+        if(el.isConnected)el.textContent='Original .apkg time unavailable — click to retry';
+        el.title=String(err?.message||err);
+      }finally {if(el.isConnected)el.dataset.busy='0';}
+    }
+    window.ankiRefreshOriginalFileMtime=ankiRefreshOriginalFileMtime;
+    // Poll only when the dashboard is visible; never rewrite the archive.
+    setInterval(()=>{
+      if(document.visibilityState==='hidden')return;
+      document.querySelectorAll('[id^="ankiOriginalMtime-"]').forEach(el=>{
+        const deckId=el.id.slice('ankiOriginalMtime-'.length);
+        void ankiRefreshOriginalFileMtime(deckId);
+      });
+    },120000);
+
     function renderDecks() {
       refreshAnkiImportDeckOptions();
       const grid = document.getElementById('decksGrid');
       const emptyNotice = document.getElementById('emptyDecksNotice');
       if(!grid) return;
+      const expandedSyncDetails=new Set(Array.from(grid.querySelectorAll('details.anki-journal-details[open][data-sync-deck]'),el=>el.dataset.syncDeck));
       grid.replaceChildren();
       let visibleCount = 0;
       const now = Date.now();
@@ -6525,7 +6827,7 @@ const content = await zip.generateAsync({ type: "blob" });
               <h3 class="anki-deck-heading font-bold text-slate-100 text-base leading-snug break-words min-w-0">${ankiEscapeHtml(deck.name)}</h3>
               <div class="flex gap-3 items-center shrink-0">
                 <span id="ankiLinkDot-${ankiEscapeHtml(deckId)}" class="anki-link-indicator ${ankiLinkConfirmed(deckId)?'anki-link-connected':''}" role="img" aria-label="${ankiLinkConfirmed(deckId)?'Original .apkg linked and autosave active':'Original .apkg not linked'}" title="${ankiLinkConfirmed(deckId)?'Original .apkg linked and autosave active':'Original .apkg not connected for autosave'}"></span>
-                ${!isStarred ? `<button type="button" onclick="renameAnkiDeck('${deckId}')" class="text-indigo-400 hover:text-indigo-300" title="Rename deck and original iCloud .apkg" aria-label="Rename deck and original iCloud .apkg"><i class="fa-solid fa-pen-to-square"></i></button>` : `<span class="text-amber-300" title="Independent Starred Cards"><i class="fa-solid fa-star"></i></span>`}
+                ${!isStarred ? `<button type="button" onclick="renameAnkiDeck('${deckId}')" class="text-indigo-400 hover:text-indigo-300" title="Rename deck title (preserve original .apkg filename and sync identity)" aria-label="Rename deck title only"><i class="fa-solid fa-pen-to-square"></i></button>` : `<span class="text-amber-300" title="Independent Starred Cards"><i class="fa-solid fa-star"></i></span>`}
                 <button type="button" onclick="deleteDeck('${deckId}')" class="text-slate-400 hover:text-rose-400" title="Delete deck" aria-label="Delete deck"><i class="fa-solid fa-trash"></i></button>
               </div>
             </div>
@@ -6556,6 +6858,7 @@ const content = await zip.generateAsync({ type: "blob" });
           <div class="anki-primary-actions flex items-center gap-2">
             <button type="button" onclick="startStudy('${deckId}')" class="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl">Study</button>
             <button type="button" onclick="saveAllDecksToFile('${deckId}')" class="py-2.5 px-3 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl">Save As</button>
+
             <button type="button" onclick="ankiRefreshDeckFromOriginal('${deckId}')" class="py-2.5 px-3 bg-slate-700 hover:bg-slate-600 text-slate-200 text-xs font-bold rounded-xl" title="Re-import this deck from the original .apkg file"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh</button>
           </div>
           <div class="flex gap-2">
@@ -6581,18 +6884,40 @@ const content = await zip.generateAsync({ type: "blob" });
         const syncRow=document.createElement('div');
         syncRow.className='rounded-xl border border-indigo-500/30 bg-indigo-500/5 px-3 py-2 space-y-2';
         const syncIdArg=encodeURIComponent(String(deckId)).replace(/'/g,'%27');
-        syncRow.className='anki-journal-summary rounded-xl border border-indigo-500/30 bg-indigo-500/5 px-3 py-2 space-y-1.5';
-        syncRow.innerHTML=`<div class="text-[11px] font-semibold text-indigo-300"><i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i> iCloud Changes</div>
-          <div id="ankiSyncState-${ankiEscapeHtml(deckId)}" role="status" aria-live="polite" class="anki-sync-display anki-sync-${window.AnkiSyncJournal?.level(deckId)||'checking'}">${ankiEscapeHtml(window.AnkiSyncJournal?.label(deckId)||'Checking iCloud journal…')}</div>
-          <details class="anki-journal-details text-[11px] text-slate-400">
-            <summary class="pt-1 text-indigo-300 font-semibold">Sync controls</summary>
+        syncRow.className='anki-journal-summary rounded-xl border border-slate-700/60 px-3 py-2 space-y-1';
+        const journalView=window.AnkiSyncJournal?.presentation(deckId)||{level:'checking',text:'Checking…',detail:'Checking iCloud journal…'};
+        const combinedView=window.AnkiSyncJournal?.combinedPresentation(deckId)||{level:'waiting',text:'SYNCHRONIZING',detail:'Waiting for journal and archive checks'};
+        syncRow.innerHTML=`<details class="anki-journal-details text-[11px] text-slate-400" data-sync-deck="${ankiEscapeHtml(deckId)}"${expandedSyncDetails.has(String(deckId))?' open':''}>
+            <summary class="anki-combined-sync-summary" title="Show synchronization details"><span class="text-[11px] font-semibold text-slate-400"><i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i> iCloud</span><span id="ankiCombinedSyncState-${ankiEscapeHtml(deckId)}" role="status" aria-live="polite" title="${ankiEscapeHtml(combinedView.detail)}" class="anki-sync-display anki-sync-${combinedView.level}">${ankiEscapeHtml(combinedView.text)}</span></summary>
+            <div class="pt-2 mt-2 border-t border-slate-700/60 space-y-1.5"><div class="flex items-center justify-between gap-2 flex-wrap"><span class="text-[11px] font-semibold text-slate-400"><i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i> iCloud</span>
+          <span id="ankiSyncState-${ankiEscapeHtml(deckId)}" title="${ankiEscapeHtml(journalView.detail)}" class="anki-sync-display anki-sync-${journalView.level}">${ankiEscapeHtml(journalView.text)}</span></div>
+          ${`<button type="button" id="ankiOriginalMtime-${ankiEscapeHtml(deckId)}"
+            onclick="ankiRefreshOriginalFileMtime(decodeURIComponent('${syncIdArg}'),true)"
+            class="block w-full text-left text-[11px] text-slate-400 hover:text-indigo-200 transition"
+            title="Check when the original .apkg was last modified on this device’s iCloud Drive copy; separate from journal sync">Original .apkg modified: checking…</button>`}
+          ${window.AnkiPCBridge?.hybridPublisher?`<div id="ankiArchiveSummary-${ankiEscapeHtml(deckId)}" class="text-[11px] text-slate-400" title="${ankiEscapeHtml(window.AnkiSyncJournal?.archiveLabel(deckId)||'')}">${ankiEscapeHtml(window.AnkiSyncJournal?.archiveSummary(deckId)||'Archive pending')}</div>`:''}
+          <div id="ankiCopyState-${ankiEscapeHtml(deckId)}" class="text-[11px] text-slate-400">${ankiEscapeHtml(window.AnkiSyncJournal?.copyPresentation(deckId).text||'Archive check pending')}</div>
+            </div>
+            <div id="ankiSyncTechnical-${ankiEscapeHtml(deckId)}" class="anki-sync-technical pt-2">${ankiEscapeHtml(journalView.detail)}</div>
+            <div class="anki-journal-countdown text-[11px] text-slate-400" data-journal-id="${ankiEscapeHtml(deckId)}" aria-live="off">${ankiEscapeHtml(window.AnkiSyncJournal?.countdownLabel?.(deckId)||'Next journal check: —')}</div>
             <div class="flex flex-wrap gap-2 pt-2">
               <button type="button" onclick="AnkiSyncJournal.activate(decodeURIComponent('${syncIdArg}'))"
                 class="px-2.5 py-1.5 rounded-lg font-semibold bg-indigo-500/15 border border-indigo-500/40 text-indigo-300"
-                title="Pause or resume this deck's iCloud change journal">${window.AnkiSyncJournal?.enabled(deckId)?'Pause iCloud Changes':'Enable iCloud Changes'}</button>
+                title="Pause or resume this deck's iCloud change journal">${window.AnkiSyncJournal?.enabled(deckId)?'Pause automatic sync':'Resume automatic sync'}</button>
               <button type="button" onclick="AnkiSyncJournal.sync(decodeURIComponent('${syncIdArg}'),true)"
                 class="px-2.5 py-1.5 rounded-lg font-semibold bg-slate-700 border border-slate-600 text-slate-200">Sync Now</button>
+              <button type="button" onclick="AnkiSyncJournal.inspect(decodeURIComponent('${syncIdArg}'))"
+                class="px-2.5 py-1.5 rounded-lg font-semibold bg-slate-700 border border-slate-600 text-slate-200" title="Read-only: check Windows bridge and journal identity">Check journal</button>
+              ${!isStarred&&/critical.?care.?echocardiography/i.test(String(deck.name||'')+' '+String(deck.sourceFileName||''))?`              <button type="button" onclick="AnkiSyncJournal.reconnectVerifiedEcho(decodeURIComponent('${syncIdArg}'))"
+                class="px-2.5 py-1.5 rounded-lg font-semibold bg-amber-500/15 border border-amber-500/40 text-amber-300" title="Reattach only if the complete local deck matches the existing 27-card journal with every card and review field verified">Verify &amp; reconnect Echo journal</button>`:``}
+              ${`<button type="button" onclick="AnkiSharedArchive.rebuild(decodeURIComponent('${syncIdArg}'))"
+                class="px-2.5 py-1.5 rounded-lg font-semibold bg-emerald-500/15 border border-emerald-500/40 text-emerald-300" title="Safely rebuild the same iCloud .apkg from this device after journal sync">Check archive publisher</button>`}
+              <button type="button" onclick="AnkiSyncJournal.verifyCopy(decodeURIComponent('${syncIdArg}'),true)" class="px-2.5 py-1.5 rounded-lg font-semibold bg-slate-700 border border-slate-600 text-slate-200">Verify archive (read only)</button>
             </div>
+            ${window.AnkiNative?.available?`<div id="ankiVersionDetail-${ankiEscapeHtml(deckId)}" class="text-[11px] text-slate-400 pt-2">${ankiEscapeHtml(window.AnkiSyncJournal?.versionLabel?.(deckId)||'Independent archive pilot: off')}</div>
+              <button type="button" id="ankiVersionToggle-${ankiEscapeHtml(deckId)}" onclick="AnkiSyncJournal.toggleVersionPilot(decodeURIComponent('${syncIdArg}'))" class="mt-1 px-2.5 py-1.5 rounded-lg font-semibold bg-indigo-500/15 border border-indigo-500/40 text-indigo-300" title="One-time per-deck pilot. Creates separate immutable versions; never changes the main original archive.">${window.AnkiSyncJournal?.versionPilotEnabled?.(deckId)?'Pause independent archive pilot':'Enable independent archive pilot'}</button>`:''}
+            <div id="ankiCopyDetail-${ankiEscapeHtml(deckId)}" class="text-[11px] text-slate-400 pt-2">${ankiEscapeHtml(window.AnkiSyncJournal?.copyPresentation(deckId).detail||'')}</div>
+            ${`<div class="text-[11px] text-slate-400 pt-2" id="ankiArchiveMirror-${ankiEscapeHtml(deckId)}">${ankiEscapeHtml(window.AnkiSyncJournal?.archiveLabel(deckId)||'Archive publisher: designated desktop')}</div>`}
           </details>`;
         const progressBar=cardEl.querySelector('.w-full.bg-slate-900.rounded-full.h-2');
         if(progressBar)progressBar.after(syncRow);else cardEl.prepend(syncRow);
@@ -6603,6 +6928,26 @@ const content = await zip.generateAsync({ type: "blob" });
         more.className='anki-deck-tools text-xs text-slate-400 border border-slate-700/70 rounded-xl';
         more.innerHTML='<summary class="text-indigo-300 font-semibold px-3 py-2">More deck tools &amp; backups</summary><div class="anki-deck-tools-content px-3 pb-3"></div>';
         const moreBody=more.querySelector('.anki-deck-tools-content');
+        const backupRow=document.createElement('div');
+        backupRow.className='flex flex-wrap gap-2 py-2';
+        if(!window.AnkiNative?.available) {
+          const quickBackup=document.createElement('button');
+          quickBackup.type='button';
+          quickBackup.className='px-2.5 py-1.5 rounded-lg border border-slate-600 bg-slate-700 text-slate-200 hover:bg-slate-600';
+          quickBackup.textContent='Quick backup (browser download)';
+          quickBackup.title='Downloads a separate .apkg using your browser settings; use Save As to choose a specific folder.';
+          quickBackup.onclick=()=>void saveAllDecksToFile(deckId,{forceDownload:true});
+          backupRow.appendChild(quickBackup);
+        }
+        if(backupRow.childElementCount)moreBody.appendChild(backupRow);
+        const advanced= document.createElement('details');
+        advanced.className='text-xs rounded-lg border border-slate-700/60 p-2';
+        advanced.innerHTML='<summary class="cursor-pointer font-semibold text-slate-300">Advanced sync &amp; recovery</summary><div class="anki-advanced-sync-buttons flex flex-wrap gap-2 py-2"></div>';
+        const advBody=advanced.querySelector('.anki-advanced-sync-buttons');
+        Array.from(syncRow.querySelectorAll('button')).filter(b=>
+          /^(Check journal|Verify & reconnect Echo journal|Rebuild original \.apkg on this device)$/i.test(b.textContent.trim()))
+          .forEach(b=>advBody.appendChild(b));
+        if(advBody.childElementCount)moreBody.appendChild(advanced);
         const legacy=document.createElement('details');
         legacy.className='anki-legacy-details text-xs text-slate-400 border border-slate-700/60 rounded-lg px-2 py-2';
         legacy.innerHTML='<summary class="text-slate-300 font-semibold">Original .apkg autosave (legacy)</summary><div class="anki-legacy-body pt-2 space-y-2"><p class="text-[11px] text-slate-400">Optional older file-saving method. iCloud Changes does not require it or the old green dot. Save As still exports a backup.</p></div>';
@@ -6641,73 +6986,65 @@ const content = await zip.generateAsync({ type: "blob" });
       });
       emptyNotice?.classList.toggle('hidden', visibleCount > 0);
       if(window.AnkiSyncJournal?.autoScan) setTimeout(()=>void window.AnkiSyncJournal.autoScan(),0);
+      setTimeout(()=>document.querySelectorAll('[id^="ankiOriginalMtime-"]').forEach(el=>
+        void ankiRefreshOriginalFileMtime(el.id.slice('ankiOriginalMtime-'.length))),0);
     }
 
+    // Rename the DISPLAY TITLE without moving or renaming the shared iCloud .apkg.
+    // Cloud filename moves are deliberately disabled until every native/desktop
+    // client can consume a stable identity embedded in the ORIGINAL archive.
+    // For an active journal, re-use the existing fileRename event envelope with
+    // from === to: this broadcasts the display title but leaves paths untouched.
     async function renameAnkiDeck(deckId) {
       if(ankiIsStarDeck(deckId)) { showToast('The Starred Cards collection has a fixed name.'); return; }
-      const deck=appState.decks[deckId];
-      if(!deck) return;
-      const input=window.prompt('New deck name (also renames its original iCloud .apkg):',deck.name || '');
+      const deck=appState.decks?.[deckId];
+      if(!deck)return;
+      if(deck.ankiPendingFileRename && deck.ankiPendingFileRename.from!==deck.ankiPendingFileRename.to){
+        alert('An older original-file rename is still waiting to synchronize. No further rename was attempted. Export a backup and resolve that pending change first.');
+        return;
+      }
+      const input=window.prompt('Rename deck. The designated desktop publisher will rename the original .apkg after journal verification.',deck.name||'');
       if(input===null)return;
       const trimmed=input.trim().replace(/\.apkg$/i,'').trim();
-      if(!trimmed||trimmed.length>180||/[\\/:*?"<>|]/.test(trimmed)||/[. ]$/.test(trimmed)){
-        alert('Enter a deck name under 180 characters without \\/ : * ? " < > | or a trailing dot.');return;
+      if(!trimmed || trimmed.length>180 || /[\\/:*?"<>|]/.test(trimmed) || /[. ]$/.test(trimmed)){
+        alert('Enter a title under 180 characters without \\/ : * ? " < > | or a trailing dot.');return;
       }
-      const newFile=trimmed+'.apkg',oldFile=String(deck.sourceFileName||'');
-      if(trimmed===deck.name && (!oldFile||oldFile===newFile))return;
-      if(oldFile && !/\.apkg$/i.test(oldFile)){alert('This deck does not have a supported original .apkg filename. No changes made.');return;}
-      if(oldFile && oldFile!==newFile){
-        const shared=Object.entries(appState.decks||{}).filter(([id,d])=>
-          id!==String(deckId) && String(d.sourceFileName||'').toLowerCase()===oldFile.toLowerCase());
-        if(shared.length){
-          alert('This original .apkg is shared by '+shared.length+' other imported deck(s), including '+
-            shared[0][1].name+'. Rename was blocked so their original-file links cannot be broken. Nothing changed.');return;
-        }
-        if(!confirm('Rename the ORIGINAL file in iCloud Drive?\n\n'+oldFile+'\n → '+newFile+
-          '\n\nExisting journal records will be kept. Another device may need iCloud time to receive the new name. No card content is changed.'))return;
-        try{
-          if(window.AnkiNative?.available){
-            if(typeof window.AnkiNative.renameFile!=='function')throw Error('This iOS app requires the updated native IPA to rename files in iCloud. Install the native upgrade; the HTML updater alone cannot rename the real file.');
-            const path=String(deck.sourceFilePath||oldFile).replace(/^Anki\//,'');
-            const result=await window.AnkiNative.renameFile(deckId,path,newFile);
-            const link=window.AnkiNative.links?.get(String(deckId));
-            if(link && link.path===path){link.path=result.path;link.name=newFile;}
-          }else if(window.AnkiPCBridge?.available){
-            await window.AnkiPCBridge.renameFile(oldFile,newFile);
-            const link=ankiLinkedHandles.get(deckId);
-            if(link?.handle?.isAnkiPCBridge){link.handle.name=newFile;}
-            const refreshed=ankiRefreshHandles.get(deckId);
-            if(refreshed?.isAnkiPCBridge){refreshed.name=newFile;}
-          }else throw Error('Rename the original iCloud file through the Windows/Mac AnkiSync launcher or the upgraded native iOS app. Ordinary browser tabs do not have safe file-rename permission.');
-        }catch(e){
-          const detail=String(e.message||e);
-          alert('Original .apkg was NOT renamed. Deck title was NOT changed.\n\n'+
-            (/Unsupported native action/i.test(detail)?'The installed iOS IPA does not support native rename yet. Rebuild and sideload the supplied updated IPA source, then retry.':detail));return;
-        }
+      if(trimmed===deck.name)return;
+      const originalFile=String(deck.sourceFileName||'');
+      const currentKey=String(deck.ankiJournal?.key||'');
+      if(deck.ankiJournal?.enabled && !/^deck-[a-f0-9]{16}$/.test(currentKey)){
+        alert('This deck has an invalid iCloud journal identity. Rename stopped without changing cards or files.');return;
       }
-      // The existing iCloud journal ID must never change because a file was renamed.
-      const oldJournalSource=window.AnkiSyncJournal?._test?.sourceName(deckId,deck)||oldFile||deck.name;
-      if(!deck.ankiJournalSource)deck.ankiJournalSource=oldJournalSource;
       const oldName=deck.name;
+      const oldSource=deck.ankiJournalSource;
+      const oldPending=deck.ankiPendingFileRename;
+      // Freeze source identity BEFORE the title changes. Existing journal keys
+      // remain untouched, and original file handles and paths stay intact.
+      if(!deck.ankiJournalSource){
+        deck.ankiJournalSource=String(originalFile||oldName).trim().toLowerCase();
+      }
       deck.name=trimmed;
-      if(oldFile){
-        deck.sourceFileName=newFile;
-        const path=String(deck.sourceFilePath||oldFile).replace(/\\/g,'/');
-        deck.sourceFilePath=(path.includes('/')?path.slice(0,path.lastIndexOf('/')+1):'')+newFile;
+      if(deck.ankiJournal?.enabled && /^.+\.apkg$/i.test(originalFile)){
+        deck.ankiPendingFileRename={from:originalFile,to:originalFile,name:trimmed};
       }
-      if(window.AnkiSyncJournal?.enabled(deckId)){
-        deck.ankiPendingFileRename={from:oldFile||newFile,to:newFile,name:trimmed};
-      }
-      const saved=await saveLocalState();
-      if(saved!==true){
-        alert('The file rename succeeded but the browser could not save the updated deck link. Keep AnkiSync open and export a backup; do not rename the file again.');return;
+      try{
+        if(await saveLocalState()!==true)throw Error('Browser storage could not verify the title change.');
+      }catch(err){
+        deck.name=oldName;
+        if(oldSource===undefined)delete deck.ankiJournalSource;
+        else deck.ankiJournalSource=oldSource;
+        if(oldPending===undefined)delete deck.ankiPendingFileRename;
+        else deck.ankiPendingFileRename=oldPending;
+        alert('Deck title was NOT changed: '+(err.message||err));return;
       }
       ankiMarkDirty(deckId);
       renderDecks();
       if(appState.activeStudyDeckId===deckId){
         const title=document.getElementById('studyDeckTitle');if(title)title.textContent=trimmed;
       }
-      showToast((oldFile&&oldFile!==newFile?'Original iCloud .apkg and deck renamed':'Deck renamed')+'; existing cards and review history unchanged.');
+      showToast(deck.ankiJournal?.enabled && originalFile
+        ? 'Deck renamed; archive rename queued for the designated desktop publisher.'
+        : 'Deck title renamed locally; original .apkg unchanged.');
     }
 
     // Search existing deck and card data without editing it or changing review progress.
@@ -8340,9 +8677,10 @@ function openAddCardModal() {
 
     // Display stored review stamps without changing the scheduling algorithm.
     function ankiUpdateCardReviewMeta(card) {
-      const el=document.getElementById('ankiCardReviewMeta');
-      if (!el) return;
-      if (!card) { el.style.display='none'; el.textContent=''; return; }
+      const targets=['ankiCardReviewMetaFront','ankiCardReviewMetaBack']
+        .map(id=>document.getElementById(id)).filter(Boolean);
+      if (!targets.length) return;
+      if (!card) { for(const el of targets){el.style.display='none';el.textContent='';} return; }
       const formatStamp=(value, absent) => {
         if (value == null || value === '') return absent;
         const n=Number(value);
@@ -8354,8 +8692,8 @@ function openAddCardModal() {
       };
       const reviewed=formatStamp(card.reviewData?.lastReviewedAt,'Never');
       const due=formatStamp(card.reviewData?.dueAt,'Not scheduled');
-      el.textContent='Last reviewed: '+reviewed+'  ·  Next due: '+due;
-      el.style.display='block';
+      const content='Last reviewed: '+reviewed+'  ·  Next due: '+due;
+      for(const el of targets){ el.textContent=content; el.style.display='block'; }
     }
 
     function showStudyCard() {
@@ -8521,6 +8859,58 @@ function ankiSelectAllEditorText(editorId) {
   selection.addRange(range);
   activeEditorId = editorId;
   savedRange = range.cloneRange();
+}
+
+
+/* Select cursor to the end of its visual line or HTML paragraph.
+   Works across styled spans without replacing or mutating editor content. */
+function ankiSelectToBoundary(editorId, mode) {
+  if (!ankiAutoSelectEditorIds.has(editorId) || !['line','paragraph'].includes(mode)) return;
+  const editor=document.getElementById(editorId), sel=window.getSelection();
+  if (!editor?.isContentEditable || !sel) return;
+  const within=r=>r && editor.contains(r.startContainer) && editor.contains(r.endContainer);
+  const visible=sel.rangeCount?sel.getRangeAt(0):null;
+  const saved=(activeEditorId===editorId && within(savedRange))?savedRange:null;
+  const start=(within(visible)?visible:saved)?.cloneRange();
+  if (!start) {showToast('Place the cursor in this text field first.');return;}
+  start.collapse(true);
+  let element=start.startContainer.nodeType===Node.TEXT_NODE?start.startContainer.parentElement:start.startContainer;
+  const blocks=new Set(['P','DIV','LI','H1','H2','H3','H4','H5','H6','BLOCKQUOTE','PRE']);
+  while(element && element!==editor && !blocks.has(element.tagName)) element=element.parentElement;
+  const block=element && element!==editor?element:editor;
+  const walker=document.createTreeWalker(block,NodeFilter.SHOW_TEXT);
+  const nodes=[];let n;
+  while((n=walker.nextNode())) {
+    if(!n.data.length || n.parentElement?.closest('[contenteditable="false"]'))continue;
+    // A text node wholly before the caret is not eligible.
+    if(start.comparePoint(n,n.length)===-1)continue;
+    nodes.push(n);
+  }
+  if(!nodes.length){showToast('No text after the cursor.');return;}
+  let endNode=null,endOffset=0,firstTop=null;
+  const probe=document.createRange();
+  outer:for(const node of nodes){
+    let offset=node===start.startContainer?start.startOffset:0;
+    for(let i=offset;i<node.length;i++){
+      if(node.data[i]==='\n' && mode==='line')break outer;
+      if(mode==='line') {
+        probe.setStart(node,i);probe.setEnd(node,i+1);
+        const rect=Array.from(probe.getClientRects()).find(r=>r.height>0);
+        if(rect){
+          if(firstTop===null)firstTop=rect.top;
+          else if(Math.abs(rect.top-firstTop)>Math.max(4,rect.height*.45))break outer;
+        }
+      }
+      endNode=node;endOffset=i+1;
+    }
+  }
+  if(!endNode)return;
+  const range=document.createRange();
+  try{range.setStart(start.startContainer,start.startOffset);range.setEnd(endNode,endOffset);}
+  catch(e){showToast('Unable to extend the selection from this cursor position.');return;}
+  if(range.collapsed)return;
+  editor.focus({preventScroll:true});sel.removeAllRanges();sel.addRange(range);
+  activeEditorId=editorId;savedRange=range.cloneRange();
 }
 
 /* Select from the actual DOM caret (not a flattened text offset) through the
@@ -10114,6 +10504,12 @@ function saveCardEdits() {
       return true;
     }
 
+    function ankiPortableIdentityFields(identity,cards){
+      if(!identity || !/^deck-[a-f0-9]{16}$/.test(String(identity.journalKey||'')))return {};
+      return {ankiPortableJournalKey:identity.journalKey,
+        ...(typeof identity.journalSource==='string'&&identity.journalSource.length<=512?{ankiJournalSource:identity.journalSource}:{}),
+        ...(identity.checkpoint?{ankiPortableCheckpoint:identity.checkpoint}:{})};
+    }
     // --- ANKI IMPORT ENGINE ---
     async function handleAnkiFileUpload(event, options = {}) {
       const folderBatch = !!options.folderBatch;
@@ -10155,7 +10551,7 @@ function saveCardEdits() {
 
       try {
         const isRawAnkiDatabase = /\.(anki|anki2|anki21)$/i.test(file.name);
-        const zip = isRawAnkiDatabase ? {files:{}, file:() => null} : await JSZip.loadAsync(file);
+        const zip = isRawAnkiDatabase ? {files:{}, file:() => null} : await AnkiSyncCompact.expand(await JSZip.loadAsync(file));
         progressBar.style.width = '30%';
         statusText.innerText = "Processing media files into IndexedDB storage...";
         percentText.innerText = "30%";
@@ -10574,7 +10970,7 @@ function saveCardEdits() {
           const existing=Object.entries(appState.decks||{}).filter(([id,d])=>
             !ankiIsStarDeck(id) && String(d.name||'').trim().toLowerCase()==='critical care echocardiography review');
           if(existing.length!==1)
-            throw new Error('Expected exactly one existing Critical Care Echocardiography Review deck on this device, found '+existing.length+'. No cards were changed.');
+            throw new Error('This is a 7-card RECOVERY package, not a full-deck import. On a new device, first import the complete 27-card iPhone/iPad export. No cards were changed. Matching decks found: '+existing.length+'.');
           const [echoId,echoDeck]=existing[0];
           if(window.AnkiSyncJournal?.enabled(echoId))
             throw new Error('Pause iCloud Changes on Critical Care Echocardiography BEFORE importing. No cards were changed.');
@@ -10661,7 +11057,7 @@ function saveCardEdits() {
             if(recoveryArchive && window.AnkiSyncJournal?.enabled(ANKI_STAR_DECK_ID)) {
               throw new Error('Pause iCloud Changes on ★ Starred Cards BEFORE importing the reconciled recovery archive. Your existing deck was not replaced.');
             }
-            if(!confirm(recoveryArchive?
+            if((recoveryArchive||(appState.decks[ANKI_STAR_DECK_ID]?.cards?.length||0)>0) && !confirm(recoveryArchive?
               'RECOVERY: Import 35 reconciled Starred Cards?\n\n'+
               'Preserves 31 reviewed iPad cards and 4 extra PC cards. Replaces ONLY this device’s local Starred collection.\n'+
               'Its previous journal settings are backed up locally. A new separate recovery journal is used after you explicitly enable iCloud Changes.\n\n'+
@@ -10689,6 +11085,7 @@ function saveCardEdits() {
               target.ankiJournal=null;
               target.ankiJournalManualPause=true; // Explicit opt-in only.
             }
+            if(!target.cards?.length&&!target.ankiJournal&&portableProgress?.decks?.length){const identities=portableProgress.decks.map(d=>d.sourceIdentity).filter(x=>x?.journalKey);if(identities.length&&identities.every(x=>x.journalKey===identities[0].journalKey))Object.assign(target,ankiPortableIdentityFields(identities[0],imported));target.ankiJournalImportCandidate=!recoveryArchive;}
             target.sourceFileName=file.name;
             target.cards=imported.map(c=>({...c,starredIndependent:true}));
             target.lastIndex=0;target.lastCardId=null;
@@ -10828,6 +11225,8 @@ function saveCardEdits() {
               id:deckId, name:importedName || file.name, category:fallbackCategory,
               sourceFilePath:canonicalPath, sourceFileName:file.name,
               sourceFingerprint,
+              ankiJournalImportCandidate: selectedDecks.length===1 && /\.apkg$/i.test(file.name) && !portableProgress?.decks?.some(d=>d.sourceIdentity?.journalKey),
+              ...(ankiLinkedSnapshot&&selectedDecks.length===1?ankiPortableIdentityFields(portableProgress?.decks?.find(d=>d.name===selectedDecks[0])?.sourceIdentity,allCards):{}),
               cards:allCards,
               lastIndex:Math.min(Math.max(...selectedDecks.map(name => importedLastIndexByDeck[name] || 0),0), Math.max(0,allCards.length-1))
             };
@@ -10844,6 +11243,22 @@ function saveCardEdits() {
           // Preserve the internal name as the lookup key for portable progress.
           const importedFileDeckName = file.name.replace(/\.(apkg|colpkg)$/i, '').trim();
           let targetDeckId = document.getElementById('ankiImportTargetDeck')?.value || '__new__';
+          if(targetDeckId==='__new__' && selectedDecks.length===1){
+            const incoming=importedCardsByDeck[selectedDecks[0]]||[];
+            const identity=portableProgress?.decks?.find(d=>d.name===selectedDecks[0])?.sourceIdentity;
+            const matchingLoaded=Object.values(appState.decks||{}).filter(d=>!ankiIsStarDeck(d.id)&&(
+              (identity?.journalKey&&identity.journalKey===(d.ankiJournal?.key||d.ankiPortableJournalKey))||
+              (d.sourceFileName===file.name&&incoming.length&&window.AnkiSyncMergeCore?.sameCards(incoming,d.cards||[]))));
+            if(matchingLoaded.length===1){
+              // Existing local history may be ahead of this archive. Keep it;
+              // journal sync will reconcile newer remote changes automatically.
+              progressContainer.classList.add('hidden');switchTab('decks');
+              void window.AnkiSyncJournal?.autoScan();
+              void window.AnkiSyncJournal?.sync(matchingLoaded[0].id,false);
+              if(!window.AnkiSyncMergeCore?.sameCards(incoming,matchingLoaded[0].cards||[]))showToast('Already open: retained your local copy. Automatic sync will check its history.');
+              event.target.value='';return;
+            }
+          }
           if(targetDeckId==='__new__' && ankiLinkedSnapshot) {
             const matches=Object.values(appState.decks||{}).filter(d=>
               !ankiIsStarDeck(d.id) && d.sourceFileName===file.name);
@@ -10899,6 +11314,7 @@ function saveCardEdits() {
               // as the one independent collection, never a second linked tile.
               if(deckName===ANKI_STAR_DECK_NAME) {
                 const collection=ankiEnsureStarredDeck();
+                if(!collection.cards.length&&!collection.ankiJournal){Object.assign(collection,ankiPortableIdentityFields(portableProgress?.decks?.find(d=>d.name===deckName)?.sourceIdentity,importedCardsByDeck[deckName]));}
                 const known=new Set(collection.cards.map(c=>String(c.id)));
                 for(const card of (importedCardsByDeck[deckName]||[])) {
                   if(!known.has(String(card.id))) {
@@ -10917,6 +11333,9 @@ function saveCardEdits() {
                   ? importedFileDeckName : deckName,
                 category: appState.selectedCategory === 'ALL' ? 'General' : appState.selectedCategory,
                 sourceFileName: file.name,
+                sourceInternalDeckName:deckName,
+                ankiJournalImportCandidate: selectedDecks.length===1 && /\.apkg$/i.test(file.name),
+                ...ankiPortableIdentityFields(portableProgress?.decks?.find(d=>d.name===deckName)?.sourceIdentity, importedCardsByDeck[deckName]),
                 cards: importedCardsByDeck[deckName],
                 lastIndex: Math.min(importedLastIndexByDeck[deckName] || 0, Math.max(0, importedCardsByDeck[deckName].length - 1)),
                 ...((linkedLastCardIdByDeck[deckName] ||
@@ -10947,9 +11366,8 @@ function saveCardEdits() {
         setTimeout(() => {
           progressContainer.classList.add('hidden');
           switchTab('decks');
-          if (ankiImportedDeckIds.size) {
-            ankiShowReviewOverview([...ankiImportedDeckIds], {imported:true});
-          }
+          // Review schedule remains available on the tile, not a modal on every import.
+          void window.AnkiSyncJournal?.autoScan();
         }, 800);
 
 
@@ -11361,6 +11779,8 @@ function isEditing(){
 }
 function setStatus(id,message){
   status.set(String(id),message);
+  // Journal UI is authoritative; legacy whole-archive sync must not overwrite its compact status.
+  if(window.AnkiSyncJournal)return;
   const el=document.getElementById('ankiSyncState-'+id);
   if(el)el.textContent=message;
 }
@@ -11697,7 +12117,7 @@ const core=root.AnkiSyncMergeCore;
 const jobs=new Map(), timers=new Map(), messages=new Map();
 // Automatic joining never overwrites an existing journal or changes a divergent
 // deck. The per-deck pause/initial-conflict states are honored on every scan.
-const joins=new Map(), initialBlocks=new Map();
+const joins=new Map(), initialBlocks=new Map(), retryAt=new Map(), persisting=new Set();
 let scanning=false, scanTimer=null;
 const stateReady=()=>typeof appState!=='undefined'&&!!appState?.decks;
 const clone=v=>JSON.parse(JSON.stringify(v));
@@ -11706,9 +12126,14 @@ const has=(o,k)=>Object.prototype.hasOwnProperty.call(o||{},k);
 const undef=h(undefined);
 const pad=n=>String(n).padStart(10,'0');
 const safeName=s=>typeof s==='string'&&/^[a-z0-9_-]{8,65}$/.test(s);
+let nextJournalPollAt=0;
+const syncPendingUntil=new Map();
+const POLL_MS=5000, FULL_CHECK_MS=15000, MANIFEST_RECHECK_MS=120000, ARCHIVE_RETRY_MS=15000;
+const manifestChecks=new Map(), lastCleanChecks=new Map(), recoveryRetry=new Map(), recoveryJobs=new Map();
 const sourceName=(id,d)=>id===STAR?(d?.ankiRecoveryJournalTag==='starred-recovery-v2-20261125'?'starred-cards-independent-recovery-v2-20261125':'starred-cards-independent'):(d?.ankiEchoRecoveryTag==='critical-care-echo-recovery-v1-20261125'?'critical-care-echo-recovery-v1-20261125':String(d.ankiJournalSource||d.sourceFileName||d.name||'').trim().toLowerCase());
 function keyFor(id,d){
   if(/^deck-[a-f0-9]{16}$/.test(String(d?.ankiJournal?.key||'')))return d.ankiJournal.key;
+  if(/^deck-[a-f0-9]{16}$/.test(String(d?.ankiPortableJournalKey||'')))return d.ankiPortableJournalKey;
   const x=sourceName(id,d);let a=2166136261,b=5381;
   for(let i=0;i<x.length;i++){a=Math.imul(a^x.charCodeAt(i),16777619);b=Math.imul(b,33)^x.charCodeAt(i);}
   return 'deck-'+(a>>>0).toString(16).padStart(8,'0')+(b>>>0).toString(16).padStart(8,'0');
@@ -11735,12 +12160,12 @@ function transport(){
       const u='/__ankisync/journal/'+method+(k?'?key='+encodeURIComponent(k)+(name?'&name='+encodeURIComponent(name):''):'');
       const r=await fetch(u,{method:method==='write'?'POST':'GET',
         headers:{'X-AnkiSync-Bridge-Token':root.__ANKISYNC_LOCAL_BRIDGE_TOKEN__,...(text===undefined?{}:{'Content-Type':'application/json'})},
-        body:text,cache:'no-store',credentials:'same-origin'});
+        body:text,cache:'no-store',credentials:'same-origin',signal:typeof AbortSignal.timeout==='function'?AbortSignal.timeout(45000):undefined});
       if(!r.ok){let why='Journal '+method+' failed ('+r.status+')';try{const o=await r.json();why=o.error||why;}catch(_){}
         const e=Error(why);e.status=r.status;throw e;}
       return method==='read'?r.text():r.json();
     };
-    return {list:k=>req('list',k),read:(k,n)=>req('read',k,n),write:(k,n,t)=>req('write',k,n,t)};
+    return {list:k=>req('list',k),read:(k,n)=>req('read',k,n),write:(k,n,t)=>req('write',k,n,t),catalog:()=>req('catalog')};
   }
   throw Error('Use the upgraded native iOS app or the Windows local bridge. Regular Chrome/GitHub cannot sync directly to iCloud Drive.');
 }
@@ -11781,8 +12206,11 @@ function diff(old,cards){
   }
   return patches;
 }
-function apply(cards, event){
-  const result=clone(cards), byId=new Map(result.map(c=>[String(c.id),c]));
+function apply(cards, event, replayOnly=false){
+  // Replay snapshots are immutable; copy only the modified card. Live apply
+  // keeps the original deep-copy semantics for rollback and persistence.
+  const result=replayOnly?cards.slice():clone(cards), byId=new Map(result.map(c=>[String(c.id),c]));
+  const copied=new Set();
   const problems=[];
   for(const p of event.patches||[]){
     const card=byId.get(String(p.id));
@@ -11794,34 +12222,66 @@ function apply(cards, event){
       if(p.removed){byId.delete(String(p.id));const idx=result.findIndex(c=>String(c.id)===String(p.id));if(idx>=0)result.splice(idx,1);}
       else{const created=clone(p.value);result.push(created);byId.set(String(p.id),created);}
     }else if(card){
-      if(p.removed)delete card[p.field];else card[p.field]=clone(p.value);
+      let target=card;
+      if(replayOnly&&!copied.has(String(p.id))){target={...card};const index=result.indexOf(card);result[index]=target;byId.set(String(p.id),target);copied.add(String(p.id));}
+      if(p.removed)delete target[p.field];else target[p.field]=clone(p.value);
     }else problems.push({id:p.id,field:p.field,reason:'Missing card'});
   }
   return {cards:result,problems};
 }
-function level(id,message){
-  const m=String(message||label(id));
-  if(enabled(id)&&/^Up To Date(?:\b|\s|·)/i.test(m))return 'ok';
-  if(/checking|initializing|uploading|in progress|connected automatically|journal enabled|reconnected automatically/i.test(m))return 'checking';
-  return 'bad';
+// Presentation only: keep the complete diagnostic and raw label for all sync safety checks.
+function presentation(id,message){
+  const deck=appState?.decks?.[id];
+  const detail=String(message||label(id));
+  const view=(level,text)=>({level,text,detail});
+  if(deck?.ankiJournal?.conflict || /^(INITIAL CONFLICT|CONFLICT HELD)/i.test(detail))return view('bad','Sync conflict');
+  if(/local browser save not verified|storage failed/i.test(detail))return view('bad','Storage error');
+  if(!enabled(id)){
+    if(deck?.ankiJournalManualPauseV4)return view('off','Sync paused');
+    if(/^(No matching iCloud journal|iCloud change journal waiting)/i.test(detail))return view('waiting','Local only');
+    return view('waiting','Local only');
+  }
+  if(/^Up To Date(?:\b|\s|·)/i.test(detail))return view('ok','Journal checked locally');
+  if(/local browser save not verified|storage failed/i.test(detail))return view('bad','Storage error');
+  if(/^(iCloud changes held safely|iCloud change journal waiting)/i.test(detail))return view('waiting','Waiting for iCloud');
+  if(/^Waiting for the card editor/i.test(detail))return view('waiting','Waiting for editor');
+  if(/^(Waiting for|Checks resume)/i.test(detail))return view('waiting','Waiting for iCloud');
+  if(/checking|initializing|uploading|restoring verified|in progress|connected automatically|journal enabled|reconnected automatically|pending/i.test(detail))return view('checking','Syncing…');
+  return view('bad','Sync error');
 }
+function level(id,message){return presentation(id,message).level;}
 function status(id,message){messages.set(String(id),message);
+  const v=presentation(id,message);
   const el=document.getElementById('ankiSyncState-'+String(id));
-  if(el){el.textContent=message;el.classList.remove('anki-sync-ok','anki-sync-bad','anki-sync-checking');el.classList.add('anki-sync-'+level(id,message));}
+  if(el){
+    if(el.textContent!==v.text)el.textContent=v.text;
+    if(el.title!==v.detail)el.title=v.detail;
+    if(!el.classList.contains('anki-sync-'+v.level)){
+      el.classList.remove('anki-sync-ok','anki-sync-bad','anki-sync-checking','anki-sync-waiting','anki-sync-off');
+      el.classList.add('anki-sync-'+v.level);
+    }
+  }
+  const technical=document.getElementById('ankiSyncTechnical-'+String(id));
+  if(technical&&technical.textContent!==v.detail)technical.textContent=v.detail;
+  paintCombined(id);
 }
 function label(id){return messages.get(String(id)) ||
   (enabled(id)?'Checking iCloud Changes…':
   'Not syncing · '+(appState?.decks?.[id]?.ankiJournalManualPause?'paused by you':'iCloud Changes not enabled'));}
 function enabled(id){return !!appState?.decks?.[id]?.ankiJournal?.enabled;}
 async function persist(id){
-  const ok=await saveLocalState();if(ok!==true)throw Error('Local browser save not verified; sync stopped.');
+  persisting.add(id);
+  try{const ok=await saveLocalState();if(ok!==true)throw Error('Local browser save not verified; sync stopped.');}finally{persisting.delete(id);}
 }
 function refresh(id){
   try{
     renderDecks();
     if(appState.activeStudyDeckId===id){renderSidebarList();if(appState.studyQueue?.length){
-      const deck=appState.decks[id];appState.studyQueue=deck.cards;
-      appState.studyIndex=Math.min(appState.studyIndex,Math.max(0,deck.cards.length-1));
+      const deck=appState.decks[id], selected=appState.studyQueue[appState.studyIndex]?.id;
+      const byId=new Map(deck.cards.map(c=>[String(c.id),c]));
+      appState.studyQueue=appState.studyQueue.map(c=>byId.get(String(c.id))).filter(Boolean);
+      const pos=appState.studyQueue.findIndex(c=>String(c.id)===String(selected));
+      appState.studyIndex=pos>=0?pos:Math.min(appState.studyIndex,Math.max(0,appState.studyQueue.length-1));
       if(typeof showStudyCard==='function')showStudyCard();
     }}
   }catch(e){console.warn('Deck UI refresh:',e);}
@@ -11836,11 +12296,24 @@ function checkManifest(m,key,id){
 function currentUnique(cards){const a=new Set();for(const c of cards){
   if(c?.id==null||a.has(String(c.id)))throw Error('Duplicate or missing ID in shared journal.');a.add(String(c.id));}}
 async function readJSON(t,key,name){const raw=await t.read(key,name);const json=JSON.parse(raw);return json;}
-async function readManifest(t,key,id){
-  const names=await t.list(key);
+async function readManifest(t,key,id,listing=null){
+  const names=listing||await t.list(key);
   if(!Array.isArray(names))throw Error('iCloud did not return a valid journal listing.');
   if(!names.includes('manifest.json'))return null;
-  return checkManifest(await readJSON(t,key,'manifest.json'),key,id);
+  const raw=await t.read(key,'manifest.json'), m=checkManifest(JSON.parse(raw),key,id);
+  // The manifest is immutable. Cache only a small SHA-256, not the image-heavy data.
+  if(!root.crypto?.subtle)return m; // Older native webviews retain full validation on each check.
+  const digest=await archiveSHA(new Blob([raw]));
+  const prior=manifestChecks.get(key);
+  if(prior&&prior.digest!==digest)throw Error('Immutable journal manifest changed; synchronization stopped');
+  manifestChecks.set(key,{digest,at:Date.now(),kind:m.kind});return m;
+}
+async function ensureManifest(t,key,id,names){
+  if(!Array.isArray(names))throw Error('Invalid journal listing');
+  if(!names.includes('manifest.json'))return !!(await recoverMissingManifest(t,key,id));
+  const check=manifestChecks.get(key);
+  if(check&&check.kind===(id===STAR?'starred':'ordinary')&&Date.now()-check.at<MANIFEST_RECHECK_MS)return true;
+  return !!(await readManifest(t,key,id,names));
 }
 function eventName(e){return e.device+'-'+pad(e.seq)+'.json';}
 const eventPattern=/^device-[a-f0-9]{32}-[0-9]{10}\.json$/;
@@ -11865,95 +12338,194 @@ function hasPriorReviews(cards){
       Number(r.intervalDays)>0 || Number(r.interval)>0));
   });
 }
+// A stable identity is stored in every new export; only the verified journal
+// history can authorize a checkpoint. Device IDs/pending writes remain local.
+function portableIdentity(id){
+  const d=appState?.decks?.[id];if(!d)return null;
+  const st=d.ankiJournal;
+  return {key:st?.key||d.ankiPortableJournalKey||null,checkpoint:st?.seen&&st?.shadow?{seen:clone(st.seen),cardFingerprints:clone(st.shadow)}:null};
+}
+function equivalentCards(local,remote){
+  if(local.length!==remote.length)return false;
+  const canonicalMedia=x=>typeof x==='string'?x.replace(/data:(?:application\/octet-stream|image\/[a-z0-9.+-]+);base64,/gi,'data:media;base64,'):x;
+  const byId=new Map(remote.map(c=>[String(c.id),c]));if(byId.size!==remote.length)return false;
+  const used=new Set();for(const card of local){const id=String(card.id),other=byId.get(id);if(!other||used.has(id))return false;used.add(id);
+    const keys=new Set([...Object.keys(card),...Object.keys(other)]);
+    for(const k of keys){if(has(card,k)!==has(other,k))return false;const a=card[k],b=other[k];if(a===b)continue;
+      if(k==='front'||k==='back'){if(canonicalMedia(a)!==canonicalMedia(b))return false;}
+      else if(core.canonical(a)!==core.canonical(b))return false;}
+  }return true;
+}
+async function replay(t,key,id,manifest,local,full=false,matchSeen=null){
+  const names=pendingList(await t.list(key));
+  let remote=manifest.cards.slice(),seen={},todo=names.slice(),match=null,events=[];
+  const consider=()=>{if((!matchSeen||archiveVector(matchSeen,seen))&&equivalentCards(local,remote))match={cards:remote,seen:clone(seen)};};
+  consider();
+  const cached=new Map();
+  while(todo.length){
+    let ready=[];
+    for(const name of todo){
+      const parsed=/^(device-[a-f0-9]{32})-([0-9]{10})\.json$/.exec(name);
+      if(!parsed || (seen[parsed[1]]||0)+1!==Number(parsed[2]))continue;
+      let ev=cached.get(name);if(!ev){ev=await readJSON(t,key,name);cached.set(name,ev);}
+      if(!ev||ev.format!==FORMAT||ev.version!==1||ev.key!==key||eventName(ev)!==name||!Array.isArray(ev.patches))throw Error('Invalid journal event: '+name);
+      if(seenReady(ev,seen))ready.push({name,ev});
+    }
+    if(!ready.length)throw Error('Waiting for incomplete iCloud journal history');
+    ready.sort((a,b)=>a.name.localeCompare(b.name));
+    const {name,ev}=ready[0],result=apply(remote,ev,true);
+    if(result.problems.length)throw Error('Conflicting changes in existing journal; local cards retained');
+    currentUnique(result.cards);remote=result.cards;seen[ev.device]=ev.seq;events.push(ev);
+    todo=todo.filter(n=>n!==name);consider();
+  }
+  if(JSON.stringify(pendingList(await t.list(key)))!==JSON.stringify(names))throw Error('Journal changed during connection; retrying');
+  return full?{match,cards:remote,seen,events,names,manifest}:match;
+}
 async function activate(id,automatic=false){
-  id=String(id);
-  if(joins.has(id))return joins.get(id);
+  id=String(id);if(joins.has(id))return joins.get(id);
   const task=(async()=>{
     if(jobs.has(id))return jobs.get(id);
     const deck=appState?.decks?.[id];if(!deck)return;
     if(enabled(id)){
       if(automatic)return;
-      // An intentional Pause remains paused across reloading the app.
-      deck.ankiJournal.enabled=false;deck.ankiJournalManualPause=true;
-      await persist(id);status(id,'iCloud change journal PAUSED by you; original .apkg untouched.');refresh(id);return;
+      lastCleanChecks.delete(id);
+      deck.ankiJournal.enabled=false;deck.ankiJournalManualPause=true;deck.ankiJournalManualPauseV4=true;
+      stopOldSync(id);await persist(id);status(id,'Paused by you');refresh(id);return;
     }
-    if(automatic && (deck.ankiJournalManualPause || deck.ankiJournal?.enabled===false))return;
+    if(automatic&&deck.ankiJournalManualPauseV4)return;
+    if(deck.ankiJournal?.conflict || deck.ankiPendingFileRename && !deck.ankiJournal?.shadow){status(id,'CONFLICT HELD: existing changes need reconciliation');return;}
     try{
-      const t=checkAvailable(),key=keyFor(id,deck),device=deviceId();
-      const previous=deck.ankiJournal;
-      if(previous && !previous.enabled && previous.key===key && previous.device===device && previous.shadow){
-        if(!(await readManifest(t,key,id)))throw Error('The shared journal manifest is missing.');
-        stopOldSync(id);
-        previous.enabled=true;deck.ankiJournalManualPause=false;
+      if(document.getElementById('studyEditMode')?.offsetParent||document.getElementById('quickAddModal')?.offsetParent)return;
+      const t=checkAvailable(),device=deviceId(),originalKey=keyFor(id,deck),previous=deck.ankiJournal;
+      const local=clone(current(id));if(!local.length)return;
+      status(id,'Checking iCloud Changes…');
+      // A previously connected device retains its exact pending changes and
+      // sequence. Never make a replacement manifest for a missing old one.
+      if(previous?.shadow&&previous.device===device){
+        const m=await readManifest(t,previous.key,id)||await recoverMissingManifest(t,previous.key,id);
+        if(m){
+        stopOldSync(id);previous.enabled=true;deck.ankiJournalManualPause=false;deck.ankiJournalManualPauseV4=false;
+        try{await persist(id);}catch(e){previous.enabled=false;throw e;}
+        refresh(id);await sync(id,false);return;
+        }
+        if(previous.pendingEvent || diff(previous.shadow,local).length)throw Error('Existing journal not downloaded yet; pending changes retained');
+      }
+      if(previous?.pendingEvent)throw Error('Pending changes belong to another device; local copy retained');
+      let keys=[originalKey];
+      // Known legacy Echo journals: only a complete card/history match can join.
+      const echo=id!==STAR&&/critical.?care.?echocardiography/i.test(String(deck.name||'')+' '+String(deck.sourceFileName||''));
+      if(echo)keys.push('deck-7506437be968f62b','deck-53bc341f80e0e5cf','deck-4de629d52bff6b87','deck-ffad69b253f07714','deck-565a85308157d172');
+      // Discover renamed legacy journals on the desktop bridge. Only compare
+      // manifests of the same kind with overlapping stable card IDs.
+      if(t.catalog){const catalog=await t.catalog();if(!Array.isArray(catalog))throw Error('Journal catalog unavailable');
+        const ids=new Set(local.map(c=>String(c.id)));
+        for(const entry of catalog){if(entry.kind===(id===STAR?'starred':'ordinary')&&entry.cardIds?.some(c=>ids.has(String(c))))keys.push(entry.key);}}
+      keys=[...new Set(keys)];let matches=[],found=false,hasEventsWithoutManifest=false;
+      for(const key of keys){
+        const listing=await t.list(key);
+        if(!Array.isArray(listing))throw Error('Invalid journal listing');
+        if(!listing.includes('manifest.json')){if(pendingList(listing).length)hasEventsWithoutManifest=true;
+          if(key!==deck.ankiPortableJournalKey&&!(echo&&key===ECHO_KEY))continue;}
+        const manifest=await readManifest(t,key,id,listing)||await recoverMissingManifest(t,key,id);
+        if(!manifest)continue;found=true;
+        if(!manifest)throw Error('Manifest temporarily unavailable');
+        try{const match=await replay(t,key,id,manifest,local);
+        if(match)matches.push({key,manifest,match});}catch(err){console.warn('Journal candidate not verified',key,err);}
+      }
+      // A portable key is authoritative only when the archive matches the
+      // actual journal. Do not silently pick among multiple legacy branches.
+      if(matches.length>1 && deck.ankiPortableJournalKey){const exact=matches.filter(x=>x.key===deck.ankiPortableJournalKey);if(exact.length===1)matches=exact;}
+      if(matches.length>1)throw Error('Multiple matching journal histories; local copy retained');
+      if(!matches.length){
+        if(found) {status(id,'INITIAL CONFLICT: local cards do not match a verified journal checkpoint; progress retained');return;}
+        if(hasEventsWithoutManifest||previous||deck.ankiPortableJournalKey||deck.ankiEchoRecoveryTag||deck.ankiRecoveryJournalTag||deck.ankiJournalManualPause||echo)
+          throw Error('Existing journal is not available; retrying without creating a replacement');
+        // Bootstrap only a fresh imported deck or an unreviewed source-backed
+        // deck. Old reviewed, unassociated local histories are never chosen as
+        // the shared baseline automatically.
+        const safeNew=!!deck.sourceFileName&&/\.apkg$/i.test(deck.sourceFileName)&&deck.ankiJournalImportCandidate===true;
+        if(!safeNew && automatic)throw Error('No verified journal; existing local progress retained');
+        if(!safeNew && !confirm('Create a new journal from this local deck? Existing archives are not changed.'))return;
+        if(!core.sameCards(local,current(id)))throw Error('Local edits arrived during setup; retrying');
+        const bootstrapKey=originalKey;
+        let manifest={format:FORMAT,version:1,key:bootstrapKey,kind:id===STAR?'starred':'ordinary',source:sourceName(id,deck),createdBy:device,createdAt:new Date().toISOString(),cards:local};
+        // Save first; immutable create-only transport must not overwrite a
+        // manifest which another device has already delivered locally.
         await persist(id);
-        status(id,'iCloud Changes reconnected automatically');refresh(id);
-        await sync(id,!automatic);
-        return;
+        try{await verifyWrite(t,originalKey,'manifest.json',manifest);}catch(e){manifest=await readManifest(t,originalKey,id);if(!manifest)throw e;}
+        const match=await replay(t,originalKey,id,manifest,local);
+        if(!match)throw Error('Another device initialized a different baseline; local copy retained');
+        matches=[{key:originalKey,manifest,match}];
       }
-      let manifest=await readManifest(t,key,id);
-      const cards=current(id);
-      if(!manifest){
-        if(automatic && hasPriorReviews(cards)){
-          // Recheck on later scans: an existing iCloud manifest may still be downloading.
-          status(id,'Waiting for a shared journal. Existing reviews were NOT made authoritative automatically.');
-          return;
-        }
-        if(automatic){
-          // A second read reduces the chance of initializing while an existing
-          // iCloud manifest is still arriving. iCloud delivery is not atomic.
-          await new Promise(resolve=>setTimeout(resolve,1400));
-          manifest=await readManifest(t,key,id);
-        }
-        if(!manifest){
-          if(!automatic && !confirm('INITIALIZE a NEW iCloud change journal from THIS device for '+deck.name+'?\n\n'+
-            'The current cards and exact review dates become its shared starting point. '+
-            'First export backups from BOTH devices. This will not overwrite any .apkg.\n\nContinue?'))return;
-          manifest={format:FORMAT,version:1,key,kind:id===STAR?'starred':'ordinary',
-            source:sourceName(id,deck),createdBy:device,createdAt:new Date().toISOString(),cards:clone(cards)};
-          try{await verifyWrite(t,key,'manifest.json',manifest);}catch(e){
-            // If another device initialized the journal first, compare with it.
-            manifest=await readManifest(t,key,id);if(!manifest)throw e;
-          }
-        }
-      }
-      if(!core.sameCards(cards,manifest.cards)){
-        const mine=fingerprints(cards),theirs=fingerprints(manifest.cards);
-        const ids=new Set([...Object.keys(mine),...Object.keys(theirs)]);
-        let different=0;const differences=[];
-        for(const i of ids)if(h(mine[i])!==h(theirs[i])){different++;if(differences.length<12)differences.push(i);}
-        initialBlocks.set(id,deck.cards);
-        status(id,'INITIAL CONFLICT: '+different+' card(s) differ; local reviews preserved · reconciliation required');
-        if(!automatic)alert('INITIAL SYNC BLOCKED for '+deck.name+'.\n\n'+different+
-          ' card(s) have different fields/review dates from the shared starting copy.\n'+
-          'The original histories are preserved. Export separate backups and reconcile before enabling this journal.\n\nExample IDs: '+differences.join(', '));
-        return;
-      }
+      const {key,manifest,match}=matches[0];
+      if(appState.decks[id]!==deck||!core.sameCards(local,current(id)))throw Error('Local edits arrived during connection; retrying');
+      if(Object.entries(appState.decks).some(([other,d])=>other!==id&&d.ankiJournal?.enabled&&d.ankiJournal.key===key))throw Error('This journal is already open in another local tile');
+      const backup={cards:deck.cards,ankiJournal:deck.ankiJournal,ankiJournalSource:deck.ankiJournalSource,ankiPortableJournalKey:deck.ankiPortableJournalKey,ankiJournalManualPause:deck.ankiJournalManualPause,ankiJournalManualPauseV4:deck.ankiJournalManualPauseV4};
       stopOldSync(id);
-      deck.ankiJournal={version:1,enabled:true,key,device,seen:{},shadow:shadowMap(cards),pendingEvent:null,pendingShadow:null,conflict:null,createdAt:Date.now()};
-      deck.ankiJournalManualPause=false;
-      await persist(id);
-      status(id,automatic?'iCloud Changes connected automatically · originals unchanged':'Journal enabled · original .apkg unchanged');
-      refresh(id);
-      await sync(id,!automatic);
-    }catch(err){
-      status(id,'iCloud change journal waiting: '+(err.message||err));
-      if(!automatic)alert('iCloud journal was not enabled:\n'+(err.message||err));
-      else console.warn('Automatic journal join waiting:',id,err);
-    }
+      // Canonicalize only exporter-induced MIME differences. Replaying from a
+      // matched historical state preserves the local review stamps exactly.
+      const remoteById=new Map(match.cards.map(c=>[String(c.id),c]));
+      deck.cards=deck.cards.map(c=>clone(remoteById.get(String(c.id))));
+      deck.ankiJournalSource=manifest.source;deck.ankiPortableJournalKey=key;
+      deck.ankiJournal={version:1,enabled:true,key,device,seen:match.seen,shadow:shadowMap(deck.cards),pendingEvent:null,pendingShadow:null,conflict:null,createdAt:Date.now()};
+      deck.ankiJournalManualPause=false;deck.ankiJournalManualPauseV4=false;
+      try{await persist(id);}catch(e){Object.assign(deck,backup);throw e;}
+      status(id,'Connected automatically');refresh(id);await sync(id,false);
+    }catch(err){status(id,'iCloud change journal waiting: '+(err.message||err));console.warn('Automatic journal connection:',id,err);}
   })();
-  joins.set(id,task);
-  try{return await task;}finally{joins.delete(id);}
+  joins.set(id,task);try{return await task;}finally{joins.delete(id);retryAt.set(id,Date.now()+30000);}
 }
 // New imports and app resumes are detected without tapping Enable/Sync Now.
 // A past manual Pause is respected. A conflicting first snapshot is held.
+// Read-only journal inspection. Never creates, pauses, or modifies a journal.
+async function inspect(id){
+  const deck=appState?.decks?.[String(id)];
+  if(!deck){alert('Deck is unavailable.');return;}
+  try{
+    const t=checkAvailable(),key=keyFor(String(id),deck);
+    const isEcho=/critical.?care.?echocardiography/i.test(String(deck.name||'')+' '+String(deck.sourceFileName||''));
+    // The additional IDs are known legacy Echo identities from the user's
+    // previous journal audit. Only read manifests and event names; no writes.
+    const keys=[...new Set([key,...(isEcho?[ 
+      'deck-4de629d52bff6b87','deck-ffad69b253f07714',
+      'deck-565a85308157d172'
+    ]:[])])];
+    const lines=[
+      'Windows local bridge: CONNECTED',
+      'Deck: '+deck.name,
+      'Source .apkg: '+(deck.sourceFileName||'none'),
+      'Source identity: '+sourceName(String(id),deck),
+      'Expected journal key: '+key,
+      'Local cards: '+(deck.cards?.length||0),
+      'Journal enabled here: '+(enabled(id)?'YES':'NO'),
+      'Manually paused here: '+(deck.ankiJournalManualPause?'YES':'NO'),
+      ''
+    ];
+    for(const k of keys){
+      const names=await t.list(k);
+      if(!names.includes('manifest.json')){
+        lines.push(k+': manifest not available on this PC');
+        continue;
+      }
+      const manifest=await readManifest(t,k,String(id));
+      const events=names.filter(n=>eventPattern.test(n)).length;
+      lines.push(k+': '+manifest.cards.length+' starting card(s); '+events+' change file(s)');
+    }
+    lines.push('','READ ONLY: No archive or journal was changed.');
+    alert(lines.join('\n'));
+  }catch(err){
+    alert('Journal check failed without changing files:\n'+(err.message||err)+
+      '\n\nStart the PC using Start-AnkiSync-on-PC.cmd and open the tab at http://127.0.0.1:47621/');
+  }
+}
+
 async function autoScan(){
   if(scanning || !stateReady() || document.visibilityState==='hidden')return;
   scanning=true;
   try{
     try{checkAvailable();}catch(_){return;} // Device folder permission can arrive later.
     for(const [id,deck] of Object.entries(appState.decks||{})){
-      if(!deck || enabled(id) || joins.has(id) ||
-          deck.ankiJournalManualPause || deck.ankiJournal?.enabled===false)continue;
+      if(!deck || enabled(id) || joins.has(id) || deck.ankiJournalManualPauseV4 || (retryAt.get(id)||0)>Date.now())continue;
       // Re-importing a corrected baseline replaces the card array. Retry it;
       // an unchanged conflict must never be retried in an endless loop.
       if(initialBlocks.has(id)){
@@ -12038,25 +12610,483 @@ async function downloadRemote(t,id,state){
       if(typeof renamed.name!=='string'||!renamed.name.trim()||renamed.name.length>180||
         typeof renamed.from!=='string'||typeof renamed.to!=='string'||
         !/\.apkg$/i.test(renamed.to)||/[\\/:*?"<>|]/.test(renamed.to)||
-        (deck.sourceFileName && deck.sourceFileName!==renamed.from && deck.sourceFileName!==renamed.to))
+        !/\.apkg$/i.test(renamed.from)||/[\\/:*?"<>|]/.test(renamed.from))
         throw Error('Conflicting or invalid remote file rename; no local changes applied.');
       if(!deck.ankiJournalSource)deck.ankiJournalSource=sourceName(id,deck);
-      deck.name=renamed.name;deck.sourceFileName=renamed.to;
-      const oldPath=String(deck.sourceFilePath||'').replace(/\\/g,'/');
-      const prefix=oldPath.includes('/')?oldPath.slice(0,oldPath.lastIndexOf('/')+1):'';
-      deck.sourceFilePath=prefix+renamed.to;
+      deck.name=renamed.name;
+      if(renamed.from!==renamed.to){
+        deck.sourceFileName=renamed.to;
+        const oldPath=String(deck.sourceFilePath||'').replace(/\\/g,'/');
+        const prefix=oldPath.includes('/')?oldPath.slice(0,oldPath.lastIndexOf('/')+1):'';
+        deck.sourceFilePath=prefix+renamed.to;
+      }
     }
+    const previousSeen=clone(state.seen),previousShadow=state.shadow;
     deck.cards=attempted.cards;
     state.seen[item.device]=item.seq;
     state.shadow=shadowMap(deck.cards);
-    try{await persist(id);}catch(e){deck.cards=previous;Object.assign(deck,previousMeta);throw e;}
+    try{await persist(id);}catch(e){deck.cards=previous;Object.assign(deck,previousMeta);state.seen=previousSeen;state.shadow=previousShadow;throw e;}
     unseen.splice(unseen.indexOf(item),1);processed++;
   }
   return {processed,remaining:unseen.length};
 }
+// One designated Windows publisher. The external journal is still immutable;
+// archives are checkpoints, never the authority for newer concurrent changes.
+const archiveBusy=new Set(), archiveRetry=new Map(), archiveReports=new Map(),archiveVerified=new Map();
+// Read-only archive checkpoint verification. Never publishes, renames, imports or repairs.
+const copyChecks=new Map();let copyJob=null,copyNext=0;
+const COPY_RECHECK=300000,COPY_RETRY=30000,COPY_SETTLE=12000;
+function copySig(d){return JSON.stringify([d?.ankiJournal?.key,d?.ankiJournal?.seen,d?.name,d?.sourceFileName]);}
+function copyClean(id,d){return !!(d?.ankiJournal?.enabled&&!d.ankiJournal.conflict&&!d.ankiJournal.pendingEvent&&!d.ankiPendingFileRename&&/^Up To Date/.test(label(id)));}
+function copyPresentation(id){
+  const d=appState?.decks?.[id],v=copyChecks.get(String(id));
+  if(!d?.ankiJournal?.enabled)return {text:'Archive check: journal disabled',detail:'Enable the existing journal to compare checkpoints.',level:'off'};
+  if(!copyClean(id,d))return {text:'Archive check: journal pending',detail:'Local journal must be clean before comparison.',level:'waiting'};
+  if(!v||v.sig!==copySig(d))return {text:'Archive check pending',detail:'Waiting to read the current iCloud archive.',level:'waiting'};
+  if(v.level==='ok'&&Date.now()-v.checked>COPY_RECHECK)return {text:'Archive recheck pending',detail:'Last verified: '+new Date(v.checked).toLocaleString(),level:'waiting'};
+  return v;
+}
+// Display only. Never authorizes, initiates, or changes a sync operation.
+function combinedStatusView(journal,archive,flags){
+  const detail=journal.detail+' · '+archive.text+' · '+archive.detail;
+  const view=(level,text,reason)=>({level,text,detail:reason+' · '+detail});
+  const bad=reason=>view('bad','NOT SYNCHRONIZING',reason);
+  const pending=reason=>view('waiting','SYNCHRONIZING',reason);
+  if(journal.level==='bad'||flags.conflict)return bad('Journal needs attention');
+  if(!flags.enabled||journal.level==='off')return bad('Journal is not enabled on this device');
+  if(flags.offline)return bad('Device reports no network connection');
+  if(/^iCloud changes held safely:/i.test(journal.detail)&&
+     !/waiting|retry|not available|timeout|timed out|network|offline|download|temporar/i.test(journal.detail))return bad('Journal check stopped safely');
+  if(journal.level!=='ok'||!flags.clean)return pending('Journal changes or checks pending');
+  if(archive.level==='bad'||archive.level==='off')return bad('Archive verification needs attention');
+  if(/^Archive check: no main-folder source/i.test(archive.text))return bad('Original archive not linked in main Anki folder');
+  if(/^Archive not verified/i.test(archive.text)&&
+     !/Local changes|not uniquely available|waiting|retrying|timed out|timeout|network|offline|download|temporar|failed to fetch/i.test(archive.detail.replace(/ · automatic retry; no files changed$/, '')))return bad('Archive verification stopped safely');
+  if(archive.level!=='ok')return pending('Archive publication, delivery or verification pending');
+  return view('ok','UP TO DATE','Journal and physical archive verified on this device; other devices may still be catching up');
+}
+function combinedPresentation(id){
+  const d=appState?.decks?.[id];
+  return combinedStatusView(presentation(id),copyPresentation(id),{
+    enabled:enabled(id),conflict:!!d?.ankiJournal?.conflict,clean:copyClean(id,d),offline:root.navigator?.onLine===false});
+}
+function paintCombined(id){
+  const el=document.getElementById('ankiCombinedSyncState-'+String(id));if(!el)return;
+  const v=combinedPresentation(id);
+  if(el.textContent!==v.text)el.textContent=v.text;
+  if(el.title!==v.detail)el.title=v.detail;
+  const cls='anki-sync-display anki-sync-'+v.level;
+  if(el.className!==cls)el.className=cls;
+}
+function paintCopy(id){const v=copyPresentation(id),el=document.getElementById('ankiCopyState-'+id),detail=document.getElementById('ankiCopyDetail-'+id);
+  if(el){if(el.textContent!==v.text)el.textContent=v.text;const cls='text-[11px] font-semibold '+({ok:'text-emerald-400',waiting:'text-amber-300',bad:'text-red-400',off:'text-slate-400'}[v.level]||'text-slate-400');if(el.className!==cls)el.className=cls;if(el.title!==v.detail)el.title=v.detail;}
+  if(detail&&detail.textContent!==v.detail)detail.textContent=v.detail;
+  paintCombined(id);
+}
+function setCopy(id,sig,level,text,detail,delay){copyChecks.set(id,{sig,level,text,detail,checked:Date.now(),next:Date.now()+delay});paintCopy(id);}
+function validVector(v){return !!v&&typeof v==='object'&&!Array.isArray(v)&&Object.entries(v).every(([k,n])=>/^device-[a-f0-9]{32}$/.test(k)&&Number.isSafeInteger(n)&&n>=0);}
+function vectorRelation(a,b){if(!validVector(a)||!validVector(b))throw Error('Invalid checkpoint vector');const keys=new Set([...Object.keys(a),...Object.keys(b)]);let older=false,newer=false;for(const k of keys){if((a[k]||0)<(b[k]||0))older=true;if((a[k]||0)>(b[k]||0))newer=true;}return older&&newer?'divergent':older?'older':newer?'newer':'equal';}
+async function compareArchiveCopy(zip,id,deck,state,local,name,names){
+  const read=async n=>{const f=zip.file(n);if(!f)throw Error('Archive lacks '+n+'; waiting for publisher');return JSON.parse(await f.async('string'));};
+  const stamp=await read('ankisync-archive-publish.json');
+  if(stamp.format!=='AnkiSyncSharedArchive'||stamp.version!==1||stamp.deckKey!==state.key)throw Error('Archive belongs to a different journal or has no valid publication stamp');
+  if(stamp.sourceName!==name)throw Error('Physical filename and publication stamp differ');
+  const relation=vectorRelation(stamp.seen,state.seen);
+  if(relation==='older')return {level:'waiting',text:'Archive pending · older checkpoint',detail:'The local journal has newer changes than this archive. Desktop publication or iCloud delivery is pending.'};
+  if(relation==='newer')return {level:'waiting',text:'Archive ahead of local journal',detail:'Waiting for this device to receive the newer journal events.'};
+  if(relation!=='equal')throw Error('Archive and local journal checkpoints diverge');
+  if(stamp.title!==deck.name||!Number.isSafeInteger(stamp.cards)||stamp.cards!==local.length||!Number.isFinite(Date.parse(stamp.publishedAt)))throw Error('Publication title, count or date differs');
+  const [identity,embedded,snapshot,progress]=await Promise.all(['ankisync-identity.json','ankisync-journal.json','ankisync-linked-state.json','ankisync-progress.json'].map(read));
+  if(identity.format!=='AnkiSyncIdentity'||identity.version!==1||identity.decks?.length!==1||embedded.format!=='AnkiSyncEmbeddedJournal'||embedded.version!==1||embedded.decks?.length!==1||snapshot.format!=='AnkiSyncLinkedDeckState'||snapshot.version!==1||!Array.isArray(snapshot.cards)||snapshot.cards.length!==stamp.cards||snapshot.sourceFileName!==name||snapshot.deckName!==deck.name||progress.format!=='AnkiSyncPortableProgress'||progress.version!==1||!Array.isArray(progress.decks))throw Error('Archive checkpoint metadata is incomplete or inconsistent');
+  const hist=embedded.history;checkManifest(hist?.manifest,state.key,id);
+  if(!archiveVector(hist.seen,stamp.seen)||!Array.isArray(hist.events))throw Error('Embedded journal checkpoint differs');
+  const fp=shadowMap(snapshot.cards);
+  for(const e of [identity.decks[0],embedded.decks[0]])if(e.journalKey!==state.key||e.originalFile!==name||e.name!==deck.name||!archiveVector(e.checkpoint?.seen,stamp.seen)||!archiveVector(e.checkpoint?.cardFingerprints,fp))throw Error('Embedded identity or fingerprints differ');
+  currentUnique(snapshot.cards);if(!equivalentCards(local,snapshot.cards))throw Error('Archive card contents or review data differ from this device');
+  const saved=progress.decks.flatMap(d=>{if(!Array.isArray(d.cards))throw Error('Invalid review metadata');return d.cards;});currentUnique(saved);
+  const reviews=new Map(saved.map(c=>[String(c.id),c]));if(saved.length!==local.length||snapshot.cards.some(c=>!reviews.has(String(c.id))||core.canonical(c.reviewData||null)!==core.canonical(reviews.get(String(c.id)).reviewData||null)))throw Error('Archive review metadata differs');
+  if(id===STAR)validateStarArchiveMetadata(await read('ankisync-starred-links.json'),progress,snapshot.cards);
+  else if(progress.decks.length!==1||zip.file('ankisync-starred-links.json'))throw Error('Unexpected grouped archive');
+  const actual=new Set(),counts={};for(const e of hist.events){const n=eventName(e);if(e.format!==FORMAT||e.version!==1||e.key!==state.key||!eventPattern.test(n)||!Number.isSafeInteger(e.seq)||e.seq<1||e.seq>(stamp.seen[e.device]||0)||!Array.isArray(e.patches)||actual.has(n))throw Error('Invalid embedded event sequence');actual.add(n);counts[e.device]=(counts[e.device]||0)+1;}
+  if(Object.entries(stamp.seen).some(([d,n])=>(counts[d]||0)!==n)||!archiveVector([...actual].sort(),pendingList(names))||!names.includes('manifest.json'))return {level:'waiting',text:'Archive check: journal delivery pending',detail:'Visible journal filenames do not yet match the embedded checkpoint.'};
+  return {level:'ok',text:'Archive matches local journal',detail:'Published '+new Date(stamp.publishedAt).toLocaleString()+' · '+stamp.cards+' cards · '+snapshot.cards.filter(c=>c.reviewData).length+' studied · '+hist.events.length+' events',stamp};
+}
+async function verifyCopy(id,manual=false){
+  id=String(id);const deck=appState?.decks?.[id],state=deck?.ankiJournal,sig=copySig(deck);
+  if(versionJob||copyJob||!copyClean(id,deck)||jobs.has(id)||archiveBusy.size||recoveryJobs.size||document.visibilityState==='hidden'){if(manual)showToast('Archive check deferred until the journal and current archive operations are idle.');return;}
+  const name=String(deck.sourceFileName||''),path=String(deck.sourceFilePath||name).replace(/\\/g,'/').replace(/^Anki\//,'');
+  if(!validArchiveName(name)||path.includes('/')){setCopy(id,sig,'waiting','Archive check: no main-folder source','A linked original in the main Anki folder is required.',COPY_RECHECK);return;}
+  copyJob=id;setCopy(id,sig,'waiting','Checking archive copy…','Reading the physical .apkg; no files or decks are modified.',COPY_RETRY);
+  try{
+    const local=current(id).slice();if(diff(state.shadow,local).length)throw Error('Local changes pending');
+    let blob;
+    if(root.AnkiNative?.available){const paths=(await root.AnkiNative.listFiles()).filter(p=>typeof p==='string'&&p.replace(/^Anki\//,'')===name);if(paths.length!==1)throw Error('Original not uniquely available on this device');blob=await root.AnkiNative.readFile(paths[0]);}
+    else if(root.AnkiPCBridge?.available){const r=await archiveReq('file',{area:'original',name});blob=await r.blob();}
+    else throw Error('No authorized archive reader');
+    if(!blob||blob.size<100||blob.size>128*1024*1024)throw Error('Archive outside the 128 MiB verification limit');
+    const zip=await JSZip.loadAsync(blob),compact=!!zip.file(AnkiSyncCompact.NAME);await AnkiSyncCompact.expand(zip);
+    if(!zip.file('collection.anki2'))throw Error('Archive database missing');
+    const t=transport(),names=await t.list(state.key),result=await compareArchiveCopy(zip,id,deck,state,local,name,names);
+    if(deck!==appState.decks[id]||state!==deck.ankiJournal||sig!==copySig(deck)||!copyClean(id,deck)||diff(state.shadow,current(id)).length||!equivalentCards(local,current(id)))throw Error('Local changes arrived during verification');
+    const detail=result.detail+' · '+(compact?'Compact v1':'Legacy')+' · '+(blob.size/1048576).toFixed(2)+' MiB · checked '+new Date().toLocaleTimeString();
+    setCopy(id,sig,result.level,result.text,detail,result.level==='ok'?COPY_RECHECK:COPY_RETRY);
+  }catch(e){setCopy(id,sig,'waiting','Archive not verified',String(e?.message||e)+' · automatic retry; no files changed',COPY_RETRY);}
+  finally{copyJob=null;copyNext=Date.now()+5000;}
+}
+function tickCopy(){
+  if(!stateReady())return;
+  const ids=Object.keys(appState.decks);for(const id of ids)if(document.getElementById('ankiCopyState-'+id))paintCopy(id);
+  if(versionJob||copyJob||Date.now()<copyNext||document.visibilityState!=='visible'||document.getElementById('view-decks')?.classList.contains('hidden')||document.getElementById('studyEditMode')?.offsetParent||document.getElementById('quickAddModal')?.offsetParent)return;
+  const now=Date.now();for(const id of ids){const d=appState.decks[id],v=copyChecks.get(id);if(!document.getElementById('ankiCopyState-'+id)||!copyClean(id,d))continue;
+    const sig=copySig(d);if(v?.sig!==sig){setCopy(id,sig,'waiting','Archive check pending','Waiting briefly for desktop publication and iCloud delivery.',COPY_SETTLE);continue;}
+    if(v.next<=now&&!jobs.has(id)&&!archiveBusy.size&&!recoveryJobs.size){void verifyCopy(id);break;}
+  }
+}
+
+// Mobile version pilot: the shared journal remains the authority, and the
+// existing desktop continues to own the canonical named archive. Versions
+// are never automatically imported, renamed, replaced, or deleted.
+const versionStates=new Map();let versionJob=null,versionCapability=null,versionCapabilityBusy=false;
+const VERSION_QUIET=90000,VERSION_RETRY=60000,VERSION_MIN_GAP=600000;
+function versionPilotKey(id){const k=appState?.decks?.[id]?.ankiJournal?.key;return /^deck-[a-f0-9]{16}$/.test(k||'')?'AnkiSync-VersionPilot-v1:'+k:null;}
+function versionPilotEnabled(id){try{const k=versionPilotKey(id);return !!k&&localStorage.getItem(k)==='1';}catch(_){return false;}}
+function versionLabel(id){if(!versionPilotEnabled(id))return 'Independent archive pilot: off';return versionStates.get(String(id))?.message||'Independent archive: waiting for journal';}
+function toggleVersionPilot(id){
+  id=String(id);const key=versionPilotKey(id);
+  if(!key||!root.AnkiNative?.available||!versionCapability){showToast('Independent archive pilot requires the new native IPA and an enabled journal.');return;}
+  try{
+    const next=versionPilotEnabled(id)?'0':'1';
+    if(next==='1'&&Object.keys(appState.decks).some(other=>other!==id&&versionPilotEnabled(other))){showToast('Pause the other deck pilot first. This release tests one deck at a time.');return;}
+    localStorage.setItem(key,next);
+    if(localStorage.getItem(key)!==next)throw Error('Pilot preference not persisted');
+    const v=versionStates.get(id)||{};v.sig=null;v.since=Date.now();v.next=0;v.limit=false;versionStates.set(id,v);
+    versionReport(id,v,next==='1'?'Independent archive: waiting for stable checkpoint':'Independent archive pilot: off');
+    const el=document.getElementById('ankiVersionToggle-'+id);if(el)el.textContent=next==='1'?'Pause independent archive pilot':'Enable independent archive pilot';
+    showToast(next==='1'?'Independent archive pilot enabled for this deck. Original files unchanged.':'Independent archive pilot paused. Existing versions kept.');
+  }catch(e){showToast('Independent archive pilot preference could not be saved: '+e.message);}
+}
+function versionReport(id,state,message){state.message=message;const el=document.getElementById('ankiVersionDetail-'+id);if(el&&el.textContent!==message)el.textContent=message;}
+function versionAllowed(id,deck){return !!(versionPilotEnabled(id)&&root.navigator?.onLine!==false&&document.visibilityState==='visible'&&copyClean(id,deck)&&deck?.cards?.length&&validArchiveName(deck.sourceFileName)&&!jobs.has(id)&&!archiveBusy.size&&!recoveryJobs.size&&!diff(deck.ankiJournal.shadow,current(id)).length);}
+async function versionCheckpoint(deck,local,seen){return archiveSHA(new Blob([core.canonical({key:deck.ankiJournal.key,seen,title:deck.name,sourceName:deck.sourceFileName,cards:local})]));}
+async function verifyVersionZip(zip,id,deck,state,local,history,name,checkpoint){
+  if(!zip.file('collection.anki2'))throw Error('Version database missing');
+  const marker=JSON.parse(await zip.file('ankisync-version.json')?.async('string')||'null');
+  if(marker?.format!=='AnkiSyncImmutableVersion'||marker.version!==1||marker.deckKey!==state.key||marker.device!==state.device||marker.checkpoint!==checkpoint||marker.originalName!==name)throw Error('Version marker differs');
+  const result=await compareArchiveCopy(zip,id,deck,state,local,name,['manifest.json',...history.names]);
+  if(result.level!=='ok')throw Error('Version checkpoint not verified: '+result.text);
+  const embedded=JSON.parse(await zip.file('ankisync-journal.json').async('string'));
+  if(core.canonical(embedded.history.manifest)!==core.canonical(history.manifest)||core.canonical(embedded.history.events)!==core.canonical(history.events))throw Error('Version history differs from replayed journal');
+  // Independently validate the SQLite database and card count before write.
+  const SQL=await initSqlJs(),db=new SQL.Database(await zip.file('collection.anki2').async('uint8array'));
+  try{if(db.exec('PRAGMA quick_check')[0]?.values?.[0]?.[0]!=='ok'||Number(db.exec('SELECT count(*) FROM cards')[0]?.values?.[0]?.[0])!==local.length)throw Error('Version database check failed');}finally{db.close();}
+}
+async function publishVersion(id,v){
+  const deck=appState.decks[id],state=deck.ankiJournal,local=clone(current(id)),name=deck.sourceFileName,title=deck.name;
+  const seen=clone(state.seen),sig=copySig(deck),native=root.AnkiNative;
+  const stable=()=>deck===appState.decks[id]&&state===deck.ankiJournal&&copySig(deck)===sig&&versionAllowed(id,deck)&&equivalentCards(local,current(id))&&core.canonical(seen)===core.canonical(state.seen);
+  versionJob=id;v.next=Date.now()+VERSION_RETRY;versionReport(id,v,'Independent archive: verifying journal…');
+  try{
+    const t=checkAvailable(),manifest=await readManifest(t,state.key,id);if(!manifest)throw Error('Canonical journal manifest unavailable');
+    const history=await replay(t,state.key,id,manifest,local,true);
+    if(!history.match||!equivalentCards(history.cards,local)||!archiveVector(history.seen,seen)||!stable())throw Error('Entire visible journal is not settled');
+    const checkpoint=await versionCheckpoint(deck,local,seen),prefix='checkpoint-'+checkpoint+'-';
+    const names=await native.versionList(state.key,state.device);
+    if(!Array.isArray(names)||names.some(n=>!/^checkpoint-[a-f0-9]{64}-[a-f0-9]{64}\.apkg$/.test(n)))throw Error('Invalid version inventory');
+    const existing=names.filter(n=>n.startsWith(prefix));
+    if(existing.length){
+      // Never replace an existing version, even if it cannot be verified.
+      const existingName=existing[0],file=await native.versionRead(state.key,state.device,existingName);
+      if(file.size>versionCapability.maxBytes||await archiveSHA(file)!==existingName.slice(-69,-5))throw Error('Existing version SHA-256 differs');
+      const zip=await ankiValidateZipBlob(file);await verifyVersionZip(zip,id,deck,state,local,history,name,checkpoint);
+      if(!stable()||!archiveVector(history.names,pendingList(await t.list(state.key))))throw Error('Journal changed while checking version');
+      v.savedSig=sig;versionReport(id,v,'Independent archive: verified existing version · '+(file.size/1048576).toFixed(2)+' MiB');return;
+    }
+    if(names.length>=versionCapability.maxVersions){v.limit=true;throw Error('Pilot limit reached (5 versions per device/deck); all existing versions preserved');}
+    if(!stable())throw Error('New edits arrived before version build');
+    versionReport(id,v,'Independent archive: building verified version…');
+    const built=await saveAllDecksToFile(id,{buildOnly:true,exportFilename:name,journalHistory:{manifest:history.manifest,events:history.events,seen:history.seen}});
+    if(!built?.blob||!stable())throw Error('Deck changed during archive generation');
+    const zip=await ankiValidateZipBlob(built.blob);
+    zip.file('ankisync-archive-publish.json',JSON.stringify({format:'AnkiSyncSharedArchive',version:1,deckKey:state.key,sourceName:name,title,device:state.device,seen:history.seen,cards:local.length,publishedAt:new Date().toISOString()}));
+    zip.file('ankisync-version.json',JSON.stringify({format:'AnkiSyncImmutableVersion',version:1,deckKey:state.key,device:state.device,checkpoint,originalName:name}));
+    // Text-only or small decks may not benefit from compaction. Preserve their full package.
+    await AnkiSyncCompact.compact(zip);
+    const output=await zip.generateAsync({type:'blob',compression:'DEFLATE',compressionOptions:{level:3}});
+    if(output.size>versionCapability.maxBytes)throw Error('Archive exceeds 64 MiB pilot limit');
+    const expanded=await ankiValidateZipBlob(output);await verifyVersionZip(expanded,id,deck,state,local,history,name,checkpoint);
+    const digest=await archiveSHA(output);
+    if(!stable()||!archiveVector(history.names,pendingList(await t.list(state.key))))throw Error('Journal changed before version write');
+    const result=await native.versionWrite(state.key,state.device,checkpoint,digest,output);
+    if(result?.sha256!==digest||result?.name!==prefix+digest+'.apkg'||result?.size!==output.size)throw Error('Native version readback verification failed');
+    v.lastWrite=Date.now();if(stable())v.savedSig=sig;
+    versionReport(id,v,'Independent archive: saved and SHA-256 verified · '+(output.size/1048576).toFixed(2)+' MiB · '+new Date().toLocaleTimeString());
+  }catch(e){versionReport(id,v,'Independent archive: held safely · '+String(e?.message||e));console.warn('Archive version:',e);}
+  finally{versionJob=null;}
+}
+function tickVersion(){
+  if(!root.AnkiNative?.available||!stateReady()||document.visibilityState!=='visible')return;
+  if(versionCapability===null&&!versionCapabilityBusy){versionCapabilityBusy=true;root.AnkiNative.versionCapabilities().then(c=>{versionCapability=c?.format===1&&c.maxBytes===64*1024*1024&&c.maxVersions===5?c:false;}).catch(()=>{versionCapability=false;}).finally(()=>{versionCapabilityBusy=false;});return;}
+  if(!versionCapability||versionJob||copyJob||archiveBusy.size||recoveryJobs.size||document.getElementById('view-decks')?.classList.contains('hidden')||document.getElementById('studyEditMode')?.offsetParent||document.getElementById('quickAddModal')?.offsetParent)return;
+  const now=Date.now();for(const [id,deck] of Object.entries(appState.decks)){
+    if(!versionPilotEnabled(id))continue;
+    let v=versionStates.get(id);if(!v){v={sig:null,since:now,next:0,lastWrite:0};versionStates.set(id,v);}
+    if(!copyClean(id,deck)||!deck.cards?.length||!validArchiveName(deck.sourceFileName)){v.sig=null;v.since=now;continue;}
+    const sig=copySig(deck);if(v.sig!==sig){v.sig=sig;v.since=now;v.next=0;v.limit=false;versionReport(id,v,'Independent archive: waiting for stable checkpoint');}
+    if(v.savedSig===sig||v.limit||now-v.since<VERSION_QUIET||now<v.next||now-v.lastWrite<VERSION_MIN_GAP||!versionAllowed(id,deck))continue;
+    if(copyPresentation(id).level==='ok'){versionReport(id,v,'Independent archive: original already verified; no extra version needed');v.next=now+30000;continue;}
+    void publishVersion(id,v);break;
+  }
+}
+function archiveLabel(id){return archiveReports.get(String(id))||'Archive publisher: designated desktop';}
+function archiveSummary(id){const m=archiveLabel(id);return /^Archive verified/.test(m)?'Archive verified on PC':/^Archive: building/.test(m)?'Archive updating…': 'Archive pending';}
+function archiveReport(id,msg){archiveReports.set(String(id),msg);const el=document.getElementById('ankiArchiveMirror-'+id);if(el)el.textContent=msg;const compact=document.getElementById('ankiArchiveSummary-'+id);if(compact){compact.textContent=archiveSummary(id);compact.title=msg;}}
+const archiveSHA=async blob=>Array.from(new Uint8Array(await root.crypto.subtle.digest('SHA-256',await blob.arrayBuffer())),b=>b.toString(16).padStart(2,'0')).join('');
+const archiveVector=(a,b)=>h(a||{})===h(b||{});
+const validArchiveName=n=>typeof n==='string'&&n.length<=185&&/^[^\\/:*?"<>|\x00-\x1f]+\.apkg$/i.test(n)&&! /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(n);
+async function archiveReq(route,params,body,headers={}){
+  const r=await fetch('/__ankisync/'+route+'?'+new URLSearchParams(params),{method:body?'POST':'GET',body:body||undefined,headers:{'X-AnkiSync-Bridge-Token':root.__ANKISYNC_LOCAL_BRIDGE_TOKEN__,...headers},cache:'no-store',credentials:'same-origin'});
+  if(!r.ok){let reason;try{reason=(await r.json()).error;}catch(_){}const e=Error(reason||'Archive request failed: '+r.status);e.status=r.status;throw e;}return r;
+}
+// Legacy AnkiSync exports contain exact IDs/review stamps in note.data. Recover
+// text and media without importing into appState; reject unknown export layouts.
+function validateStarArchiveMetadata(marker,progress,cards,exactSnapshot=true){
+  if(marker?.format!=='AnkiSyncStarredIndependentCollection'||marker.version!==2||!Array.isArray(marker.groups))throw Error('Original is not an independent Starred archive');
+  if(!progress.decks.every(d=>d.name===ANKI_STAR_DECK_NAME||d.name.startsWith(ANKI_STAR_DECK_NAME+'::')))throw Error('Original includes unrelated decks');
+  const saved=progress.decks.flatMap(d=>d.cards),links=marker.groups.flatMap(g=>g.cards||[]);
+  currentUnique(cards);currentUnique(saved);
+  if(saved.length!==cards.length||links.length!==cards.length||new Set(links.map(c=>String(c.mirrorCardId))).size!==cards.length)throw Error('Starred archive membership differs');
+  const byId=new Map(saved.map(c=>[String(c.id),c])),byLink=new Map(links.map(c=>[String(c.mirrorCardId),c]));
+  for(const card of cards){const p=byId.get(String(card.id)),l=byLink.get(String(card.id));
+    if(!p||!l||card.starredIndependent!==true||h(p.reviewData||null)!==h(card.reviewData||null)||
+       String(l.sourceDeckId||'')!==String(card.starredSourceDeckId||'')||String(l.sourceCardId||'')!==String(card.starredSourceCardId||'')||
+       String(l.sourceDeckName||'')!==String(card.starredSourceDeckName||'')||(exactSnapshot&&l.cardDigest!==ankiStarCardDigest(card)))throw Error('Starred archive review or source metadata differs');
+  }
+}
+async function readArchiveCards(zip,id){
+  const raw=await zip.file('ankisync-progress.json')?.async('string');
+  if(!raw)throw Error('Original has no portable review metadata; automatic replacement withheld');
+  const p=JSON.parse(raw);
+  const star=id===STAR;
+  if(p.format!=='AnkiSyncPortableProgress'||p.version!==1||!Array.isArray(p.decks)||!p.decks.length||(!star&&p.decks.length!==1)||p.decks.some(d=>!Array.isArray(d.cards)))throw Error('Original has incompatible AnkiSync deck layout');
+  const saved=p.decks.flatMap(d=>d.cards);
+  const starMarker=star?JSON.parse(await zip.file('ankisync-starred-links.json')?.async('string')||'null'):null;
+  if(!star&&zip.file('ankisync-starred-links.json'))throw Error('Original belongs to Starred Cards');
+  const side=zip.file('ankisync-linked-state.json');
+  if(side){const d=JSON.parse(await side.async('string'));if(d.format!=='AnkiSyncLinkedDeckState'||d.version!==1||!Array.isArray(d.cards))throw Error('Invalid original snapshot');
+    currentUnique(d.cards);if(!archiveVector(d.cards.map(c=>String(c.id)).sort(),saved.map(c=>String(c.id)).sort()))throw Error('Original snapshot and progress IDs differ');if(star)validateStarArchiveMetadata(starMarker,p,d.cards);return d.cards;}
+  const sql=zip.file('collection.anki2');if(!sql)throw Error('Legacy archive database cannot be verified');
+  const SQL=await initSqlJs(),db=new SQL.Database(await sql.async('uint8array'));
+  try{
+    const rows=db.exec('SELECT notes.flds, notes.data FROM cards JOIN notes ON cards.nid=notes.id ORDER BY cards.id')[0]?.values||[];
+    if(rows.length!==saved.length)throw Error('Original card count differs from progress');
+    const media=JSON.parse(await zip.file('media').async('string')),reverse=new Map(Object.entries(media).map(([k,v])=>[v,k]));
+    const expand=async html=>{let out=html;for(const m of html.matchAll(/src="([^"\r\n]+)"/g)){
+      if(m[1].startsWith('data:'))continue;
+      const entry=zip.file(m[1])||zip.file(reverse.get(m[1]));if(!entry)continue;
+      out=out.replace(m[0],'src="data:application/octet-stream;base64,'+await entry.async('base64')+'"');}return out;};
+    const byId=new Map(saved.map(c=>[String(c.id),c])),cards=[];
+    for(const [flds,data] of rows){const fields=flds.split('\x1f'),meta=JSON.parse(data||'{}').ankiSync;const rec=byId.get(String(meta?.cardId));
+      if(fields.length!==3||!rec||h(meta.reviewData||null)!==h(rec.reviewData||null))throw Error('Legacy archive cannot be matched exactly');
+      const c={id:meta.cardId,title:await expand(fields[0]),front:await expand(fields[1]),back:await expand(fields[2])};
+      if(meta.reviewData)c.reviewData=meta.reviewData;
+      if(meta.starred)c.starred=true;
+      for(const k of ['starredSourceDeckName','starredSourceDeckId','starredSourceCardId'])if(meta[k])c[k]=meta[k];
+      if(star)c.starredIndependent=true;
+      cards.push(c);}
+    currentUnique(cards);if(star)validateStarArchiveMetadata(starMarker,p,cards,false);return cards;
+  }finally{db.close();}
+}
+// Restore ONLY an exact, independently replayable embedded manifest. Do not
+// invent a new baseline, restore a different deck, or overwrite a visible record.
+async function verifyEmbeddedRecovery(t,key,id,embedded,stamp,snapshot,identity,local,state){
+  if(embedded?.format!=='AnkiSyncEmbeddedJournal'||embedded.version!==1||embedded.decks?.length!==1||
+     identity?.format!=='AnkiSyncIdentity'||identity.version!==1||identity.decks?.length!==1||
+     identity.decks[0].journalKey!==key||embedded.decks[0].journalKey!==key||
+     stamp?.format!=='AnkiSyncSharedArchive'||stamp.version!==1||stamp.deckKey!==key||
+     snapshot?.format!=='AnkiSyncLinkedDeckState'||snapshot.version!==1||!Array.isArray(snapshot.cards)||
+     snapshot.cards.length!==stamp.cards)throw Error('Archive does not contain a verified matching checkpoint');
+  currentUnique(snapshot.cards);
+  const history=embedded.history,manifest=checkManifest(history?.manifest,key,id);
+  if(!Array.isArray(history.events)||!archiveVector(history.seen,stamp.seen)||
+      !archiveVector(identity.decks[0].checkpoint?.seen,stamp.seen)||
+      !archiveVector(embedded.decks[0].checkpoint?.seen,stamp.seen))throw Error('Embedded checkpoint vector differs');
+  if(!archiveVector(identity.decks[0].checkpoint?.cardFingerprints,shadowMap(snapshot.cards))||
+      !archiveVector(embedded.decks[0].checkpoint?.cardFingerprints,identity.decks[0].checkpoint?.cardFingerprints))throw Error('Embedded snapshot fingerprints differ');
+  const byName=new Map();for(const e of history.events){
+    if(e?.format!==FORMAT||e.version!==1||e.key!==key||!Array.isArray(e.patches)||!Number.isSafeInteger(e.seq)||e.seq<1)throw Error('Invalid embedded journal event');
+    const name=eventName(e);if(!eventPattern.test(name)||byName.has(name))throw Error('Duplicate or invalid embedded event');byName.set(name,e);
+  }
+  const archived={list:async()=>[...byName.keys()],read:async(k,n)=>JSON.stringify(byName.get(n))};
+  const complete=await replay(archived,key,id,manifest,local,true,state?.key===key?state.seen:null);
+  if(!archiveVector(complete.seen,stamp.seen)||!equivalentCards(complete.cards,snapshot.cards))throw Error('Embedded history does not reproduce the archive');
+  const names=pendingList(await t.list(key)), visible=new Set(names);
+  // Never fill a partially delivered event stream. Restore the missing manifest
+  // only once every event from the checkpoint is visible and matches exactly.
+  for(const [name,e] of byName){
+    if(!visible.has(name))throw Error('Waiting for archived journal event '+name);
+    const actual=await readJSON(t,key,name);if(core.canonical(actual)!==core.canonical(e))throw Error('Visible event differs from embedded history: '+name);
+  }
+  const live=archiveVector(names,complete.names)?complete:await replay(t,key,id,manifest,local,true,state?.key===key?state.seen:null);
+  if(!live.match)throw Error('Local deck does not match a verified journal checkpoint; no recovery');
+  if(state?.key===key && (!archiveVector(live.match.seen,state.seen)||!archiveVector(shadowMap(live.match.cards),state.shadow)))
+    throw Error('Local journal checkpoint differs from archived history; no recovery');
+  return {manifest,names:live.names};
+}
+async function recoverMissingManifest(t,key,id){
+  const deck=appState?.decks?.[id],state=deck?.ankiJournal;
+  if(!deck||id===STAR||deck.ankiJournalManualPauseV4||state?.pendingEvent||state?.conflict||deck.ankiPendingFileRename)return null;
+  const echo=key===ECHO_KEY&&/critical.?care.?echocardiography/i.test(String(deck.name||'')+' '+String(deck.sourceFileName||''));
+  if(state?.key!==key&&deck.ankiPortableJournalKey!==key&&!echo)return null;
+  if(state?.shadow&&diff(state.shadow,current(id)).length)return null;
+  if(recoveryJobs.has(key))return recoveryJobs.get(key);
+  if((recoveryRetry.get(key)||0)>Date.now())return null;
+  recoveryRetry.set(key,Date.now()+60000);
+  const task=(async()=>{
+    const local=clone(current(id));
+    const candidates=new Set([String(deck.sourceFileName||''),String(deck.name||'')+'.apkg']);
+    let nativePaths=[];
+    if(root.AnkiNative?.available){
+      nativePaths=(await root.AnkiNative.listFiles()).filter(p=>typeof p==='string'&&!p.replace(/^Anki\//,'').includes('/')&&validArchiveName(p.split('/').pop()));
+      if(echo)for(const p of nativePaths)if(/critical.?care.?echocardiography/i.test(p))candidates.add(p.split('/').pop());
+    }
+    // Bound archive reads; do not scan unrelated or recovery-folder packages.
+    let lastError=null;
+    for(const name of [...candidates].filter(validArchiveName).slice(0,4)){
+      try{
+        const path=nativePaths.find(p=>p.split('/').pop()===name);
+        const blob=root.AnkiNative?.available?(path?await root.AnkiNative.readFile(path):null):
+          root.AnkiPCBridge?.available?await (await archiveReq('file',{area:'original',name})).blob():null;
+        if(!blob)continue;
+        const zip=await ankiValidateZipBlob(blob),read=async n=>{const entry=zip.file(n);return entry?JSON.parse(await entry.async('string')):null;};
+        const embedded=await read('ankisync-journal.json'),stamp=await read('ankisync-archive-publish.json');
+        const snapshot=await read('ankisync-linked-state.json'),identity=await read('ankisync-identity.json');
+        if(stamp?.sourceName!==name)throw Error('Archive filename does not match publication stamp');
+        const checked=await verifyEmbeddedRecovery(t,key,id,embedded,stamp,snapshot,identity,local,state);
+        if(deck!==appState.decks[id]||deck.ankiJournal!==state||deck.ankiJournalManualPauseV4||state?.pendingEvent||deck.ankiPendingFileRename||!equivalentCards(local,current(id)))throw Error('Local changes arrived during recovery; retry');
+        const listing=await t.list(key);
+        if(listing.includes('manifest.json')){
+          const actual=await readManifest(t,key,id,listing);
+          if(core.canonical(actual)!==core.canonical(checked.manifest))throw Error('Delivered manifest differs from embedded baseline');
+          return actual;
+        }
+        if(!archiveVector(pendingList(listing),checked.names))throw Error('Journal changed during recovery; retry');
+        status(id,'Restoring verified missing journal manifest…');
+        // Existing immutable journal transport is create-only. If another device
+        // delivers a conflicting manifest, fail closed instead of replacing it.
+        try{await verifyWrite(t,key,'manifest.json',checked.manifest);}catch(e){
+          const actual=await readManifest(t,key,id);
+          if(!actual||core.canonical(actual)!==core.canonical(checked.manifest))throw e;
+        }
+        const restored=await readManifest(t,key,id);
+        if(!restored||core.canonical(restored)!==core.canonical(checked.manifest))throw Error('Manifest recovery readback failed');
+        lastCleanChecks.delete(id);return restored;
+      }catch(e){lastError=e;console.warn('Manifest recovery held:',name,e);}
+    }
+    if(lastError)throw Error('Missing manifest recovery held safely: '+(lastError.message||lastError));
+    return null;
+  })();
+  recoveryJobs.set(key,task);try{return await task;}finally{recoveryJobs.delete(key);}
+}
+async function publishArchive(id,manual=false){
+  id=String(id);if(!root.AnkiPCBridge?.hybridPublisher||(id===STAR&&!root.AnkiPCBridge?.starredPublisher)){if(manual)archiveReport(id,'Archive is published only on the designated desktop with compatible bridge');return;}
+  if(archiveBusy.has(id)||jobs.has(id)||(!manual&&(archiveRetry.get(id)||0)>Date.now()))return;
+  const deck=appState?.decks?.[id],state=deck?.ankiJournal;
+  if(!state?.enabled||state.conflict||state.pendingEvent||deck.ankiPendingFileRename||!/^Up To Date/.test(label(id)))return;
+  archiveBusy.add(id);archiveRetry.set(id,Date.now()+ARCHIVE_RETRY_MS);
+  try{
+    const cached=archiveVerified.get(id),signature=JSON.stringify([state.key,state.seen,deck.name,deck.sourceFileName]);
+    if(cached?.signature===signature && Date.now()-cached.at<300000){
+      const r=await archiveReq('file-updated',{name:deck.sourceFileName});if((await r.json()).mtimeMs===cached.mtime)return;
+    }
+    if(diff(state.shadow,current(id)).length)return;
+    const t=checkAvailable(),manifest=await readManifest(t,state.key,id)||await recoverMissingManifest(t,state.key,id);if(!manifest)throw Error('Journal not available');
+    const local=clone(current(id)),title=deck.name,history=await replay(t,state.key,id,manifest,local,true);
+    if(!history.match||!equivalentCards(history.cards,local)||!archiveVector(history.seen,state.seen))throw Error('Local deck has not applied the entire visible journal');
+    const lastRename=history.events.filter(e=>e.fileRename).at(-1)?.fileRename;
+    // Only an explicit recorded title rename changes a physical filename.
+    const sourcePath=String(deck.sourceFilePath||'').replace(/\\/g,'/');
+    if(sourcePath.includes('/')&&sourcePath.split('/').slice(0,-1).some(p=>p&&p!=='Anki'))throw Error('Archive source is outside the main Anki folder');
+    let original=String(deck.sourceFileName||''),desired=id!==STAR&&lastRename?.name===title?title+'.apkg':original;
+    if(id===STAR&&(!local.length||!/^\s*(?:★\s*|00\.\s*)?Starred Cards\.apkg$/i.test(original)))throw Error('Starred publisher requires the linked nonempty independent Starred Cards archive');
+    if(id===STAR&&Object.entries(appState.decks).some(([other,d])=>other!==id&&String(d.sourceFileName||'').toLowerCase()===original.toLowerCase()))throw Error('Original is shared by another deck; no publication');
+    if(!validArchiveName(original)||!validArchiveName(desired))throw Error('Original or requested archive name is invalid');
+    const stable=()=>deck===appState.decks[id]&&deck.ankiJournal===state&&state.enabled&&!state.pendingEvent&&!state.conflict&&!deck.ankiPendingFileRename&&deck.name===title&&core.sameCards(local,current(id))&&archiveVector(history.seen,state.seen);
+    let response;try{response=await archiveReq('file',{area:'original',name:original});}catch(e){
+      if(e.status!==404||desired===original)throw e;
+      response=await archiveReq('file',{area:'original',name:desired});original=desired;}
+    const old=await response.blob(),expected=await archiveSHA(old),zip=await ankiValidateZipBlob(old);
+    const stamp=zip.file('ankisync-archive-publish.json')?JSON.parse(await zip.file('ankisync-archive-publish.json').async('string')):null;
+    if(stamp&&(stamp.deckKey!==state.key||!Object.entries(stamp.seen||{}).every(([d,n])=>(history.seen[d]||0)>=n)))throw Error('Original archive belongs to a different or newer journal');
+    const oldCards=await readArchiveCards(zip,id);
+    const oldMatch=equivalentCards(oldCards,history.cards)||equivalentCards(oldCards,manifest.cards)||!!(await replay(t,state.key,id,manifest,oldCards));
+    if(!oldMatch)throw Error('Original content/review stamps do not match a verified journal checkpoint; original retained');
+    if(!stable()||!archiveVector(history.names,pendingList(await t.list(state.key))))throw Error('New edits arrived during archive check');
+    if(desired!==original){let exists=false;try{await archiveReq('stat',{area:'original',name:desired});exists=true;}catch(e){if(e.status!==404)throw e;}if(exists)throw Error('Requested filename already exists; neither archive was overwritten');}
+    let digest=expected;
+    if(!stamp||!archiveVector(stamp.seen,history.seen)||stamp.title!==title||!equivalentCards(oldCards,local)){
+      archiveReport(id,'Archive: building verified checkpoint…');
+      const built=await saveAllDecksToFile(id,{buildOnly:true,exportFilename:desired,journalHistory:{manifest:history.manifest,events:history.events,seen:history.seen}});
+      if(!built?.blob)throw Error('Could not generate archive');
+      const resultZip=await ankiValidateZipBlob(built.blob);
+      if(id===STAR&&!equivalentCards(await readArchiveCards(resultZip,id),local))throw Error('Generated Starred archive does not preserve exact cards');
+      resultZip.file('ankisync-archive-publish.json',JSON.stringify({format:'AnkiSyncSharedArchive',version:1,deckKey:state.key,sourceName:desired,title,device:state.device,seen:history.seen,cards:local.length,publishedAt:new Date().toISOString()}));
+      let output;
+      if(root.AnkiPCBridge?.compactWriter===true && await AnkiSyncCompact.compact(resultZip)){
+        output=await resultZip.generateAsync({type:'blob',compression:'DEFLATE',compressionOptions:{level:3}});
+        const checked=await AnkiSyncCompact.checkFile(output);
+        if(!checked.isCompact||checked.count!==local.length||checked.key!==state.key)throw Error('Compact archive failed verification');
+      }else output=await resultZip.generateAsync({type:'blob',compression:'DEFLATE',compressionOptions:{level:3}});
+      if(!stable()||!archiveVector(history.names,pendingList(await t.list(state.key))))throw Error('Journal changed during archive generation');
+      const r=await archiveReq('hybrid-publish',{name:original,key:state.key,count:String(local.length),device:state.device},output,{'X-AnkiSync-Expected-SHA256':expected,'Content-Type':'application/octet-stream'});
+      digest=(await r.json()).sha256;if(digest!==await archiveSHA(output))throw Error('Archive SHA-256 verification failed');
+    }
+    if(desired!==original){
+      if(!stable()||!archiveVector(history.names,pendingList(await t.list(state.key))))throw Error('Journal changed before rename');
+      const r=await archiveReq('rename',{area:'original',name:original},JSON.stringify({newName:desired}),{'X-AnkiSync-Expected-SHA256':digest,'Content-Type':'application/json'});
+      if((await r.json()).sha256!==digest)throw Error('Archive rename verification failed');
+    }
+    // A crash after rename is recoverable: the desired archive is found by its
+    // verified embedded journal identity on the next pass. Broadcast only after
+    // the actual rename, using the existing compatible event envelope.
+    if(deck.sourceFileName!==desired){
+      const from=deck.sourceFileName,priorPath=deck.sourceFilePath;deck.sourceFileName=desired;deck.sourceFilePath=desired;
+      deck.ankiPendingFileRename={from,to:desired,name:title};
+      try{await persist(id);}catch(e){deck.sourceFileName=from;deck.sourceFilePath=priorPath;delete deck.ankiPendingFileRename;throw e;}
+      refresh(id);dirty(id);
+    }
+    archiveReport(id,'Archive verified locally · '+local.length+' cards · '+new Date().toLocaleTimeString());
+    try{const r=await archiveReq('file-updated',{name:desired});archiveVerified.set(id,{signature:JSON.stringify([state.key,state.seen,deck.name,deck.sourceFileName]),mtime:(await r.json()).mtimeMs,at:Date.now()});}catch(_){}
+    if(typeof ankiRefreshOriginalFileMtime==='function')void ankiRefreshOriginalFileMtime(id,true);
+  }catch(e){archiveReport(id,'Archive waiting · '+(e.message||e));console.warn('Hybrid archive:',e);}
+  finally{archiveBusy.delete(id);}
+}
+
+const ECHO_KEY='deck-7506437be968f62b';
+async function migrateEcho(t,id,deck,state){
+  if(state.key===ECHO_KEY || id===STAR || !/critical.?care.?echocardiography/i.test(String(deck.name||'')+' '+String(deck.sourceFileName||'')))return state;
+  if(state.pendingEvent||state.conflict||deck.ankiPendingFileRename||diff(state.shadow,current(id)).length)throw Error('Echo migration waiting: local edits on the old journal are preserved');
+  const local=clone(current(id)),m=await readManifest(t,ECHO_KEY,id)||await recoverMissingManifest(t,ECHO_KEY,id);
+  if(!m)throw Error('Waiting for the verified Echo journal to become available');
+  if(m.source!=='critical_care_echocardiography_review.apkg')throw Error('Unexpected Echo journal identity');
+  const target=await replay(t,ECHO_KEY,id,m,local,true);
+  if(!target.match)throw Error('Echo migration waiting: local deck does not match the verified new history');
+  const old=await readManifest(t,state.key,id);
+  if(!old)throw Error('Echo migration waiting: old journal not available for verification');
+  const prior=await replay(t,state.key,id,old,local,true);
+  if(!prior.match||!equivalentCards(prior.cards,local)||h(prior.seen)!==h(state.seen))throw Error('Echo migration waiting: old journal has unmerged changes');
+  if(!core.sameCards(local,current(id))||deck.ankiJournal!==state||deck.ankiPendingFileRename)throw Error('Local edits arrived during migration');
+  if(Object.entries(appState.decks).some(([other,d])=>other!==id&&d.ankiJournal?.enabled&&d.ankiJournal.key===ECHO_KEY))throw Error('Correct Echo journal already open in another tile');
+  const backup={cards:deck.cards,ankiJournal:state,ankiJournalSource:deck.ankiJournalSource,ankiPortableJournalKey:deck.ankiPortableJournalKey};
+  const byId=new Map(target.match.cards.map(c=>[String(c.id),c]));
+  deck.cards=deck.cards.map(c=>clone(byId.get(String(c.id))));
+  deck.ankiJournal={version:1,enabled:true,key:ECHO_KEY,device:deviceId(),seen:target.match.seen,shadow:shadowMap(deck.cards),pendingEvent:null,pendingShadow:null,conflict:null,createdAt:Date.now()};
+  deck.ankiJournalSource=m.source;deck.ankiPortableJournalKey=ECHO_KEY;
+  try{await persist(id);}catch(e){Object.assign(deck,backup);throw e;}
+  refresh(id);return deck.ankiJournal;
+}
 async function sync(id,manual=false){
   id=String(id);if(jobs.has(id))return jobs.get(id);
-  const deck=appState?.decks?.[id],state=deck?.ankiJournal;
+  const deck=appState?.decks?.[id];let state=deck?.ankiJournal;
   if(!state?.enabled){if(manual)alert('Enable iCloud Changes on this deck first.');return;}
   if(state.conflict){status(id,'CONFLICT HELD: export both versions and reconcile; no files overwritten');return;}
   const work=(async()=>{
@@ -12064,38 +13094,90 @@ async function sync(id,manual=false){
       status(id,'Waiting for the card editor to close');return;
     }
     const t=checkAvailable();
+    state=await migrateEcho(t,id,deck,state);
     if(keyFor(id,deck)!==state.key||deviceId()!==state.device)throw Error('Deck identity or device identity changed; sync stopped.');
-    const manifest=await readManifest(t,state.key,id);
-    if(!manifest)throw Error('The shared journal manifest disappeared; sync paused.');
+    const names=await t.list(state.key);
+    if(!await ensureManifest(t,state.key,id,names))throw Error('The shared journal manifest is not available; retrying automatically.');
+    const listing=new Set(pendingList(await t.list(state.key)));
+    const listingSig=JSON.stringify([...listing]), clean=lastCleanChecks.get(id);
+    const sig=JSON.stringify([state.key,state.seen,deck.name,deck.sourceFileName]);
+    // Poll names every 5s; periodically perform a full content check even if a
+    // caller failed to signal dirty. Never fast-skip a pending or manual sync.
+    if(!manual && clean?.state===state && clean.listing===listingSig && clean.signature===sig &&
+        Date.now()-clean.at<FULL_CHECK_MS && !state.pendingEvent&&!deck.ankiPendingFileRename&&
+        !timers.has(id)&&/^Up To Date/.test(label(id))){
+      if(root.AnkiPCBridge?.hybridPublisher&&(id!==STAR||root.AnkiPCBridge?.starredPublisher))setTimeout(()=>void publishArchive(id),0);
+      return;
+    }
+    lastCleanChecks.delete(id);
+    for(const [dev,seq] of Object.entries(state.seen||{}))if(seq>0&&!listing.has(dev+'-'+pad(seq)+'.json'))throw Error('Waiting for a previously seen journal event to download');
     if(state.pendingEvent){
       // The local change may have reached iCloud before the app was suspended.
       await publishLocal(t,id,state);
     }else await publishLocal(t,id,state);
     const result=await downloadRemote(t,id,state);
-    status(id,result.remaining?'Waiting for '+result.remaining+' incomplete iCloud event(s)':
+    const localPending=diff(state.shadow,current(id)).length||state.pendingEvent||deck.ankiPendingFileRename;
+    status(id,result.remaining?'Waiting for '+result.remaining+' incomplete iCloud event(s)':localPending?'Local edits pending · uploading soon':
       'Up To Date · '+new Date().toLocaleTimeString()+(result.processed?' · '+result.processed+' change(s) received':''));
     if(result.processed)refresh(id);
+    if(!result.remaining&&!localPending){
+      const finalSig=JSON.stringify([state.key,state.seen,deck.name,deck.sourceFileName]);
+      // Do not cache a newer listing: only the names known before the sync
+      // are safe to skip; a local publish or remote arrival triggers another pass.
+      if([...listing].every(n=>{const m=/^(device-[a-f0-9]{32})-([0-9]{10})\.json$/.exec(n);return m&&Number(m[2])<=(state.seen[m[1]]||0);}))
+        lastCleanChecks.set(id,{state,listing:listingSig,signature:finalSig,at:Date.now()});
+      if(root.AnkiPCBridge?.hybridPublisher&&(id!==STAR||root.AnkiPCBridge?.starredPublisher)){
+        if(archiveVerified.get(id)?.signature!==finalSig&&!archiveBusy.has(id))archiveReport(id,'Archive pending · new journal checkpoint');
+        setTimeout(()=>void publishArchive(id),0);
+      }
+    }
   })().catch(e=>{status(id,'iCloud changes held safely: '+(e.message||e));if(manual)alert('Sync stopped without overwriting original .apkg:\n'+(e.message||e));
     console.error('AnkiSync journal sync:',e);
   }).finally(()=>jobs.delete(id));
   jobs.set(id,work);return work;
 }
-function dirty(id){if(!enabled(id))return;
+function dirty(id){if(!enabled(id)||persisting.has(id))return;
+  lastCleanChecks.delete(String(id));
+  const st=appState.decks[id].ankiJournal;if(!st.pendingEvent&&!appState.decks[id].ankiPendingFileRename&&!diff(st.shadow,current(id)).length)return;
   status(id,'Unsynced changes pending · uploading soon');
-  clearTimeout(timers.get(id));timers.set(id,setTimeout(()=>{timers.delete(id);void sync(id,false);},1800));
+  if(root.AnkiPCBridge?.hybridPublisher&&(id!==STAR||root.AnkiPCBridge?.starredPublisher)&&!archiveBusy.has(String(id)))archiveReport(String(id),'Archive pending · local changes');
+  clearTimeout(timers.get(id));syncPendingUntil.set(String(id),Date.now()+1800);
+  timers.set(id,setTimeout(()=>{timers.delete(id);syncPendingUntil.delete(String(id));void sync(id,false);},1800));
 }
+function countdownLabel(id){
+  if(!enabled(id))return 'Journal is disabled · no automatic check scheduled';
+  if(document.visibilityState==='hidden')return 'Checks resume when StudyDesk is visible';
+  const pending=syncPendingUntil.get(String(id));
+  const next=pending || nextJournalPollAt;
+  if(!next)return 'Waiting for journal schedule';
+  return (pending?'Next change upload attempt':'Next journal check')+' in '+Math.max(0,Math.ceil((next-Date.now())/1000))+'s · '+
+    'archive updates are handled by the designated desktop publisher';
+}
+function paintCountdowns(){
+  document.querySelectorAll('.anki-journal-countdown[data-journal-id]').forEach(el=>{
+    el.textContent=countdownLabel(el.getAttribute('data-journal-id'));
+  });
+  root.AnkiSharedArchive?.paintCountdowns?.();
+  tickCopy();
+  tickVersion();
+}
+
 function onReady(){
   // Previous whole-.apkg autosync is disabled when the journal takes over.
-  for(const d of Object.values(appState.decks||{}))if(d.ankiAutoSync?.enabled){d.ankiAutoSync.enabled=false;}
+  for(const [id,d] of Object.entries(appState.decks||{})){if(d.ankiAutoSync?.enabled)d.ankiAutoSync.enabled=false;if(root.AnkiNative?.available||root.AnkiPCBridge?.available)stopOldSync(id);}
   if(scanTimer)clearInterval(scanTimer);
+  if(!root.__ankiJournalCountdownTimer)root.__ankiJournalCountdownTimer=setInterval(paintCountdowns,1000);
+  nextJournalPollAt=Date.now()+POLL_MS;
   scanTimer=setInterval(()=>{
+    nextJournalPollAt=Date.now()+POLL_MS;
     if(document.visibilityState!=='visible')return;
     void autoScan();
     for(const id of Object.keys(appState.decks||{}))if(enabled(id))void sync(id);
-  },15000);
+  },POLL_MS);
   window.addEventListener('focus',()=>{
     void autoScan();for(const id of Object.keys(appState.decks||{}))if(enabled(id))void sync(id);
   });
+  window.addEventListener('online',()=>{retryAt.clear();void autoScan();for(const id of Object.keys(appState.decks||{}))if(enabled(id))void sync(id);});
   document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'){
     void autoScan();for(const id of Object.keys(appState.decks||{}))if(enabled(id))void sync(id);
   }});
@@ -12103,9 +13185,134 @@ function onReady(){
     void autoScan();for(const id of Object.keys(appState.decks||{}))if(enabled(id))void sync(id);
   },1200);
 }
-root.AnkiSyncJournal={enabled,activate,sync,dirty,label,level,onReady,autoScan,
+
+// One-time opt-in, fail-closed reconnection for Critical Care Echo.
+// Journal history was independently audited in an exported read-only ZIP:
+// 7 baseline + 25 immutable events -> 27 cards.
+// Does not rename, overwrite, create, or delete ANY iCloud .apkg or journal.
+async function reconnectVerifiedEcho(id){
+  id=String(id);
+  const deck=appState?.decks?.[id];
+  if(!deck || !/critical.?care.?echocardiography/i.test(String(deck.name||'')+' '+String(deck.sourceFileName||''))){
+    alert('This repair is restricted to Critical Care Echocardiography Review. No changes made.');return;
+  }
+  if(!root.AnkiPCBridge?.available){alert('Open StudyDesk through the Windows .cmd launcher; no changes made.');return;}
+  if(enabled(id) || joins.has(id) || jobs.has(id)){
+    alert('This deck already has an active or busy journal. Stop; no repair was performed.');return;
+  }
+  if(deck.ankiJournal?.pendingEvent || deck.ankiJournal?.conflict || deck.ankiPendingFileRename){
+    alert('Unfinished local sync or rename data exists. Export a backup and resolve it before reconnecting. No changes made.');return;
+  }
+  const key='deck-53bc341f80e0e5cf';
+  const originalSource='ankisync-critical-care-echo-reconciled-7-cards-recovery.apkg';
+  const equivalentMedia=(a,b)=>{
+    if(typeof a!=='string'||typeof b!=='string')return false;
+    // Only an exporter-induced image/octet-stream MIME label may differ.
+    // Every byte of the base64 media and all surrounding HTML must still match.
+    const canonicalMedia=x=>x.replace(/data:(?:application\/octet-stream|image\/[a-z0-9.+-]+);base64,/gi,
+      'data:media;base64,');
+    return canonicalMedia(a)===canonicalMedia(b);
+  };
+  // Progress backup before any local modification is highly recommended.
+  // Verify the entire state, including review dates, not merely the card count.
+  try{
+    const t=checkAvailable();
+    const first=await t.list(key);
+    if(!first.includes('manifest.json'))throw Error('The established journal manifest is not downloaded on this PC. No changes made.');
+    const eventNames=first.filter(n=>eventPattern.test(n)).sort();
+    if(eventNames.length<25)throw Error('Only '+eventNames.length+' of the 25 expected journal changes are available. Wait for iCloud to finish syncing.');
+    const m=await readManifest(t,key,id);
+    if(m.source!==originalSource || m.cards.length!==7)
+      throw Error('Recovery journal identity or starting cards do not match the audited journal.');
+    let remote=clone(m.cards), seen={},todo=eventNames.map(name=>({name}));
+    const cached=new Map();
+    while(todo.length){
+      let ready=[];
+      for(const item of todo){
+        let ev=cached.get(item.name);
+        if(!ev){ev=await readJSON(t,key,item.name);cached.set(item.name,ev);}
+        if(!ev||ev.format!==FORMAT||ev.version!==1||ev.key!==key||
+           !eventPattern.test(item.name)||eventName(ev)!==item.name||!Array.isArray(ev.patches))
+          throw Error('Invalid journal change record '+item.name);
+        if(seenReady(ev,seen))ready.push({item,ev});
+      }
+      if(!ready.length)throw Error('Journal is incomplete or has missing earlier events. No changes made.');
+      ready.sort((a,b)=>a.item.name.localeCompare(b.item.name));
+      const {item,ev}=ready[0];
+      const applied=apply(remote,ev);
+      if(applied.problems.length)throw Error('A journal event has '+applied.problems.length+' unresolved card-field conflicts. No changes made.');
+      remote=applied.cards;seen[ev.device]=ev.seq;
+      todo=todo.filter(x=>x.name!==item.name);
+    }
+    const local=current(id);
+    if(local.length!==27||remote.length!==27)throw Error('Expected 27 cards both locally and in the restored journal. Local='+local.length+', journal='+remote.length+'.');
+    const remoteById=new Map(remote.map(c=>[String(c.id),c]));
+    if(remoteById.size!==27)throw Error('Duplicate IDs found in the journal; no changes made.');
+    const normalized=clone(local);
+    const mismatches=[];
+    for(const c of normalized){
+      const other=remoteById.get(String(c.id));
+      if(!other){mismatches.push(String(c.id)+' missing remotely');continue;}
+      // Compare all fields and review dates. For exported image MIME labels only,
+      // restore the journal's exact field after checking identical base64 data.
+      const fields=new Set([...Object.keys(c),...Object.keys(other)]);
+      for(const field of fields)if(h(c[field])!==h(other[field])){
+        if((field==='front'||field==='back') && equivalentMedia(c[field],other[field])){
+          c[field]=other[field];
+        }else mismatches.push(String(c.id)+' / '+field);
+      }
+    }
+    if(mismatches.length){
+      throw Error('Your 27 local cards are not identical to the journal. '+mismatches.length+
+        ' field difference(s), e.g. '+mismatches.slice(0,5).join(', ')+
+        '. Existing changes and review progress are preserved; no repair was applied.');
+    }
+    // Check remote event names once more immediately before saving local metadata.
+    const second=(await t.list(key)).filter(n=>eventPattern.test(n)).sort();
+    if(JSON.stringify(second)!==JSON.stringify(eventNames))
+      throw Error('A new iCloud journal event arrived during verification. Retry the check.');
+    if(!confirm('Verified: your 27 cards, all fields, and review dates MATCH the established 25-event journal (PNG MIME differences only).\n\n'+
+      'Reconnect THIS Windows deck to journal '+key+'?\n\n'+
+      'This updates only StudyDesk local synchronization metadata. No .apkg or journal files will be changed or created.\n\n'+
+      'Please retain your 27-card backup.'))return;
+    const previous={cards:deck.cards,journal:deck.ankiJournal,source:deck.ankiJournalSource,
+      paused:deck.ankiJournalManualPause};
+    try{
+      stopOldSync(id);
+      // Set exactly the canonical field formatting without changing content,
+      // then establish a baseline for future edits. Preserve card order.
+      deck.cards=normalized;
+      deck.ankiJournalSource=originalSource;
+      deck.ankiJournal={version:1,enabled:true,key,device:deviceId(),seen,
+        shadow:shadowMap(normalized),pendingEvent:null,pendingShadow:null,
+        conflict:null,createdAt:Date.now()};
+      deck.ankiJournalManualPause=false;
+      await persist(id);
+    }catch(err){
+      deck.cards=previous.cards;deck.ankiJournal=previous.journal;
+      deck.ankiJournalSource=previous.source;deck.ankiJournalManualPause=previous.paused;
+      throw err;
+    }
+    refresh(id);
+    await sync(id,true); // Detect any events added since the final listing.
+    const resultLabel=label(id);
+    if(!enabled(id)||!/^Up To Date(?:\b|\s|·)/i.test(resultLabel)){
+      alert('The original journal association is saved locally, but the next sync has NOT reached green Up To Date.\n\n'+
+        resultLabel+'\n\nDo not edit cards, rebuild the original .apkg, or create a new journal. Send this message for review.');
+      return;
+    }
+    alert('Windows verified and reconnected all 27 cards to the established journal.\n\n'+
+      'Status: '+resultLabel+'\n\nDo NOT rebuild or rename the original .apkg yet.');
+  }catch(err){
+    console.error('Echo journal verified reconnect refused:',err);
+    alert('Echo reconnection stopped:\n'+(err.message||err)+'\n\n'+
+      'No original .apkg or iCloud journal files were changed.');
+  }
+}
+
+root.AnkiSyncJournal={enabled,activate,sync,dirty,label,level,presentation,combinedPresentation,countdownLabel,onReady,autoScan,inspect,reconnectVerifiedEcho,
   // pure helpers exposed for regression tests
-  _test:{keyFor,fingerprints,diff,apply,seenReady,deviceId,sourceName}};
+  portableIdentity,publishArchive,archiveLabel,archiveSummary,copyPresentation,verifyCopy,versionLabel,versionPilotEnabled,toggleVersionPilot,_test:{compareArchiveCopy,vectorRelation,keyFor,fingerprints,diff,apply,seenReady,deviceId,sourceName,replay,equivalentCards,migrateEcho,validateStarArchiveMetadata,readArchiveCards,verifyEmbeddedRecovery,recoverMissingManifest,ensureManifest,readManifest}};
 })(window);
 
 </script>
@@ -12242,5 +13449,234 @@ async function ankiExportLocalReviewState() {
 }
 </script>
 
+
+<script id="ankisync-shared-archive-rebuilder-v1">
+/* Multi-device, user-initiated shared .apkg rebuilder.
+ * Works with the macOS local archive bridge, installed native iOS AnkiNative
+ * file actions, or Chrome File System Access to an authorized iCloud folder.
+ * NOT automatic: iCloud Drive is eventually consistent; local compare-and-swap
+ * is not a safe cross-device distributed lock. Never claim automatic safety.
+ */
+(function(root){
+'use strict';
+const busy=new Set(),reports=new Map();
+const MAX=512*1024*1024;
+const valid=name=>typeof name==='string' && name.length>5 && name.length<181 &&
+  /^[^/\\:*?"<>|\x00-\x1f]+\.apkg$/i.test(name);
+const label=id=>reports.get(String(id))||'Shared archive: rebuild from any device · manual until cross-device locking is available';
+function paint(id){const el=document.getElementById('ankiArchiveMirror-'+String(id));if(el)el.textContent=label(id);}
+function setStatus(id,msg){reports.set(String(id),msg);paint(id);}
+const mac=!!root.__ANKISYNC_MAC_ARCHIVE_BRIDGE__;
+const native=!!root.AnkiNative?.available && typeof root.AnkiNative.writeFile==='function';
+const hash=async(blob)=>{
+  if(!root.crypto?.subtle)throw Error('SHA-256 required to rebuild a shared archive');
+  const sum=await root.crypto.subtle.digest('SHA-256',await blob.arrayBuffer());
+  return Array.from(new Uint8Array(sum),b=>b.toString(16).padStart(2,'0')).join('');
+};
+const normalize=name=>String(name).replace(/[^a-z0-9() _.-]/gi,'_');
+async function info(blob){
+  if(!blob||blob.size<100||blob.size>MAX)throw Error('Original .apkg has an invalid size');
+  const zip=await ankiValidateZipBlob(blob);
+  const raw=await zip.file('ankisync-progress.json')?.async('string');
+  if(!raw)throw Error('Original package has no AnkiSync portable progress metadata; manual inspection is required');
+  const data=JSON.parse(raw);
+  if(data?.format!=='AnkiSyncPortableProgress'||data.version!==1||data.decks?.length!==1)
+    throw Error('Original package is not a one-deck AnkiSync archive');
+  const cards=data.decks[0].cards;
+  if(!Array.isArray(cards))throw Error('Original package has invalid card metadata');
+  const ids=cards.map(c=>String(c.id));
+  if(new Set(ids).size!==ids.length)throw Error('Duplicate card IDs in original archive');
+  const saved=zip.file('ankisync-archive-publish.json');
+  let stamp=null;
+  if(saved){stamp=JSON.parse(await saved.async('string'));
+    if(stamp?.format!=='AnkiSyncSharedArchive' || stamp.version!==1)throw Error('Unknown archive publishing metadata');
+  }
+  return {ids,stamp,sha256:await hash(blob),size:blob.size};
+}
+async function macReq(method,path,blob){
+  const response=await fetch('/__ankisync/archive/'+path,{method,
+    headers:{'X-AnkiSync-Bridge-Token':root.__ANKISYNC_LOCAL_BRIDGE_TOKEN__,
+      ...(blob?{'Content-Type':'application/octet-stream'}:{})},
+    body:blob||undefined,cache:'no-store',credentials:'same-origin'});
+  let result;try{result=await response.json();}catch(_){throw Error('Mac bridge returned an invalid response');}
+  if(!response.ok)throw Error(result.error||'Mac bridge archive access failed');
+  return result;
+}
+async function chooseTarget(deck){
+  if(mac){
+    const list=await macReq('GET','list');
+    const available=(list.items||[]).filter(v=>valid(v.name));
+    if(!available.length)throw Error('No .apkg files found in iCloud Drive/Anki');
+    const wanted=deck.ankiSharedArchiveTarget||deck.sourceFileName;
+    const idx=Math.max(0,available.findIndex(v=>v.name===wanted));
+    const selected=prompt('Choose the existing ORIGINAL .apkg to rebuild:\n\n'+
+      available.map((a,i)=>(i+1)+'. '+a.name).join('\n')+'\n\nFile number:',String(idx+1));
+    if(selected===null)return null;
+    const at=Number(selected)-1;
+    if(!Number.isInteger(at)||at<0||at>=available.length)throw Error('Invalid original archive selection');
+    return {kind:'mac',name:available[at].name};
+  }
+  if(native){
+    const all=(await root.AnkiNative.listFiles()).filter(valid);
+    if(!all.length)throw Error('No original .apkg files found in the authorized iCloud Anki folder');
+    const wanted=deck.ankiSharedArchiveTarget||deck.sourceFilePath||deck.sourceFileName||'';
+    const idx=Math.max(0,all.findIndex(p=>p===wanted||p.endsWith('/'+wanted)));
+    const chosen=prompt('Choose the existing ORIGINAL .apkg to rebuild:\n\n'+
+      all.map((p,i)=>(i+1)+'. '+p).join('\n')+'\n\nFile number:',String(idx+1));
+    if(chosen===null)return null;
+    const at=Number(chosen)-1;
+    if(!Number.isInteger(at)||at<0||at>=all.length)throw Error('Invalid original archive selection');
+    return {kind:'native',name:all[at].split('/').pop(),path:all[at]};
+  }
+  // A folder picker is opened synchronously in this user-initiated handler.
+  // This prevents accidental saving to a downloaded copy outside iCloud Drive.
+  if(typeof root.showDirectoryPicker!=='function')throw Error('This browser cannot write an iCloud folder. Use the supported PC bridge in Chrome or the native app.');
+  const folder=await root.showDirectoryPicker({id:'study-desk-icloud-anki',mode:'readwrite'});
+  if(!folder)return null;
+  const names=[];
+  for await(const [name,entry] of folder.entries())if(entry.kind==='file'&&valid(name))names.push(name);
+  names.sort();
+  if(!names.length)throw Error('Selected folder has no original .apkg files');
+  const wanted=deck.ankiSharedArchiveTarget||deck.sourceFileName;
+  const idx=Math.max(0,names.indexOf(wanted));
+  const chosen=prompt('Choose the existing original .apkg from this iCloud Anki folder:\n\n'+
+    names.map((name,i)=>(i+1)+'. '+name).join('\n')+'\n\nFile number:',String(idx+1));
+  if(chosen===null)return null;
+  const at=Number(chosen)-1;
+  if(!Number.isInteger(at)||at<0||at>=names.length)throw Error('Invalid original archive selection');
+  const folderHasChanges=await folder.getDirectoryHandle('AnkiSync-Changes',{create:false}).then(()=>true).catch(()=>false);
+  if(!folderHasChanges)throw Error('Select the iCloud Drive/Anki folder containing AnkiSync-Changes, not a downloaded copy');
+  return {kind:'browser',name:names[at],folder,handle:await folder.getFileHandle(names[at],{create:false})};
+}
+const vectorCovers=(have,need)=>Object.entries(need||{}).every(([dev,seq])=>
+  Number.isSafeInteger(seq)&&seq>=0&&(Number(have?.[dev])||0)>=seq);
+async function shaCards(cards){return hash(new Blob([JSON.stringify(cards)],{type:'application/json'}));}
+async function verifySnapshot(id){
+  const deck=appState.decks?.[id];
+  if(!deck||!Array.isArray(deck.cards)||!deck.cards.length)throw Error('Load the complete deck before rebuilding its archive');
+  if(id==='anki_starred_cards_collection_v1')throw Error('Starred collection requires separate snapshot handling; no archive changed');
+  const journal=deck.ankiJournal;
+  if(!journal?.enabled || journal.conflict || journal.pendingEvent)
+    throw Error('iCloud Changes must be enabled, settled, and conflict-free before rebuilding');
+  await root.AnkiSyncJournal.sync(id,true);
+  if(!/^Up To Date(?:\b|\s|·)/.test(root.AnkiSyncJournal.label(id)))
+    throw Error('Journal has not reached Up To Date; refusing archive replacement');
+  if(journal.conflict||journal.pendingEvent)throw Error('Journal conflict or pending change; try again after resolving');
+  const ids=deck.cards.map(c=>String(c?.id));
+  if(ids.some(id=>id==='undefined'||id==='null')||new Set(ids).size!==ids.length)
+    throw Error('Deck contains missing or duplicate IDs; no archive changed');
+  const before=await shaCards(deck.cards);
+  return {deck,journal,ids,seen:JSON.parse(JSON.stringify(journal.seen||{})),before};
+}
+async function makePackage(id,name,snapshot){
+  const built=await saveAllDecksToFile(id,{buildOnly:true,exportFilename:name});
+  if(!built?.blob)throw Error('Could not build a complete .apkg');
+  const zip=await ankiValidateZipBlob(built.blob);
+  const manifest={format:'AnkiSyncSharedArchive',version:1,deckKey:snapshot.journal.key,
+    sourceName:name,device:snapshot.journal.device,seen:snapshot.seen,
+    cards:snapshot.ids.length,cardHash:snapshot.before,publishedAt:new Date().toISOString()};
+  zip.file('ankisync-archive-publish.json',JSON.stringify(manifest));
+  const blob=await zip.generateAsync({type:'blob',compression:'DEFLATE',compressionOptions:{level:3}});
+  const check=await info(blob);
+  if(check.ids.length!==snapshot.ids.length || !snapshot.ids.every(id=>check.ids.includes(id)) ||
+     check.stamp?.cardHash!==snapshot.before)throw Error('Generated archive verification failed; no write performed');
+  if(await shaCards(snapshot.deck.cards)!==snapshot.before)throw Error('Cards changed during export; retry after journal sync');
+  return blob;
+}
+async function backupToFolder(folder,file,name){
+  const d=await folder.getDirectoryHandle('AnkiSync-Archive-Backups',{create:true});
+  const stamp=new Date().toISOString().replace(/[:.]/g,'-');
+  const filename=normalize(name.replace(/\.apkg$/i,''))+'__'+stamp+'__'+
+    (await hash(file)).slice(0,12)+'__'+Math.random().toString(36).slice(2,9)+'.apkg';
+  const h=await d.getFileHandle(filename,{create:true});
+  const writer=await h.createWritable({keepExistingData:false});
+  try{await writer.write(file);await writer.close();}catch(err){try{await writer.abort();}catch(_){}throw err;}
+  if(await hash(await h.getFile())!==await hash(file))throw Error('Recovery backup failed SHA-256 verification');
+}
+async function write(target,id,originalInfo,blob){
+  if(target.kind==='mac'){
+    const result=await macReq('POST','publish?name='+encodeURIComponent(target.name)+
+      '&expected='+encodeURIComponent(originalInfo.sha256)+'&cards='+originalInfo.newCount,blob);
+    if(result.sha256!==await hash(blob))throw Error('Mac bridge did not verify the expected SHA-256');
+    return result;
+  }
+  if(target.kind==='native'){
+    // linkFile makes a SHA-256-verified backup and locks to an expected hash
+    // within the native coordinator before allowing completeWrite.
+    const result=await root.AnkiNative.advanceLink(id,target.path);
+    if(!result?.sha256 || result.sha256!==originalInfo.sha256)
+      throw Error('Native original changed before link verification; no write performed');
+    const reply=await root.AnkiNative.writeFile(id,target.path,originalInfo.sha256,blob);
+    if(reply.sha256!==await hash(blob))throw Error('Native original failed SHA-256 readback');
+    if(root.AnkiNative.links){root.AnkiNative.links.set(id,{...reply,path:target.path,paused:false,dirty:false,busy:false});}
+    return reply;
+  }
+  const latest=await target.handle.getFile();
+  if(await hash(latest)!==originalInfo.sha256)throw Error('Original changed while preparing the snapshot; no write performed');
+  await backupToFolder(target.folder,latest,target.name);
+  const before=await target.handle.getFile();
+  if(await hash(before)!==originalInfo.sha256)throw Error('Original changed during backup; no write performed');
+  const writer=await target.handle.createWritable({keepExistingData:false});
+  try{await writer.write(blob);await writer.close();}catch(err){try{await writer.abort();}catch(_){}throw err;}
+  if(await hash(await target.handle.getFile())!==await hash(blob))throw Error('Original readback mismatch. Restore from verified backup.');
+  return {sha256:await hash(blob)};
+}
+async function rebuild(id){
+  id=String(id);
+  if(root.AnkiPCBridge?.hybridPublisher){return root.AnkiSyncJournal.publishArchive(id,true);}
+  if(root.AnkiNative?.available || !root.AnkiPCBridge?.hybridPublisher){alert('Archive publication is automatic on the designated desktop. No archive changed.');return;}
+  if(busy.has(id))return;
+  const deck=appState?.decks?.[id];
+  if(!deck){alert('Load a deck before rebuilding the original .apkg');return;}
+  busy.add(id);setStatus(id,'Selecting shared original .apkg…');
+  try{
+    const target=await chooseTarget(deck);
+    if(!target){setStatus(id,'Rebuild cancelled; original unchanged');return;}
+    if(!valid(target.name))throw Error('Invalid original archive filename');
+    const snap=await verifySnapshot(id);
+    let remote;
+    if(target.kind==='mac'){
+      remote=await macReq('GET','info?name='+encodeURIComponent(target.name));
+    }else{
+      const file=target.kind==='native'?await root.AnkiNative.readFile(target.path):await target.handle.getFile();
+      remote=await info(file);
+    }
+    const oldids=remote.ids||[];
+    if(!oldids.every(id=>snap.ids.includes(String(id))))throw Error('Original has cards missing from this device. Rebuild blocked to prevent card loss.');
+    if(remote.stamp){
+      if(remote.stamp.deckKey!==snap.journal.key)throw Error('Archive belongs to a different journal deck key');
+      if(!vectorCovers(snap.seen,remote.stamp.seen))throw Error('Another device published changes not yet synchronized here; do not overwrite');
+    }
+    const agreed=confirm('Rebuild the SAME original iCloud .apkg from this device?\n\n'+
+      target.name+'\nOriginal: '+remote.cards+' cards\nCurrent: '+snap.ids.length+' cards\n\n'+
+      'A verified recovery backup will be created first. Use this on ONE device at a time. '+
+      'iCloud Drive cannot guarantee cross-device locking; do not rebuild simultaneously. Continue?');
+    if(!agreed){setStatus(id,'Rebuild cancelled; original unchanged');return;}
+    setStatus(id,'Building and validating '+snap.ids.length+'-card package…');
+    const blob=await makePackage(id,target.name,snap);
+    if(await shaCards(snap.deck.cards)!==snap.before)throw Error('Local deck changed during build; retry');
+    // Final journal check. This cannot guarantee all other devices have uploaded,
+    // but prevents publication when this local journal reports pending data.
+    if(snap.journal.conflict||snap.journal.pendingEvent||
+       !/^Up To Date(?:\b|\s|·)/.test(root.AnkiSyncJournal.label(id)))
+      throw Error('New journal changes or conflict appeared while building');
+    setStatus(id,'Verified backup and shared-archive write underway…');
+    const result=await write(target,id,{...remote,newCount:snap.ids.length},blob);
+    deck.ankiSharedArchiveTarget=target.path||target.name;
+    await saveLocalState();
+    setStatus(id,'Shared original .apkg rebuilt on this device · '+snap.ids.length+
+      ' cards · '+new Date().toLocaleTimeString());
+    if(typeof showToast==='function')showToast('Verified original .apkg rebuilt: '+target.name);
+    return result;
+  }catch(err){
+    const message=String(err?.message||err);
+    setStatus(id,'Shared archive NOT changed / verification required: '+message);
+    console.error('Shared archive rebuild:',err);
+    if(err?.name!=='AbortError')alert('Shared .apkg rebuild stopped:\n'+message+'\n\nYour deck was kept locally. Check backups before retrying.');
+  }finally{busy.delete(id);}
+}
+root.AnkiSharedArchive={rebuild,label,paintCountdowns:()=>{for(const id of reports.keys())paint(id);}};
+})(window);
+</script>
 </body>
 </html>
