@@ -1,57 +1,15 @@
-AnkiSync iCloud Change Journal v1 — CONTROLLED PILOT
-===================================================
+# AnkiSync iOS — 2.5.0 (build 10)
 
-This is a NEW sync protocol using immutable per-device JSON records under:
-    iCloud Drive / Anki / AnkiSync-Changes / deck-<id> /
-The original .apkg files are NOT overwritten by this protocol.
+Read README-ARCHIVE-DISCOVERY.txt for current installation, test procedure, and limitations.
 
-PREPARE
-1. Export and keep a separate .apkg backup from EACH device. You previously
-   had 357 due on iPad and 378 on iPhone; DO NOT discard either copy.
-2. Use a disposable test .apkg first, imported identically on both devices.
-   Do not enable the real MA Sleep deck until its existing differences are reconciled.
-3. Never combine old "Enable Sync" (full .apkg overwrite) and new journal sync.
-   The updated interface disables old automatic .apkg sync when it initializes.
+AnkiSync — Verified Cross-Device Archive Discovery
 
-WINDOWS PC
-1. Extract the PC ZIP outside iCloud Drive.
-2. Close all older AnkiSync launchers listening on port 47621.
-3. Double-click Start-AnkiSync-on-PC.cmd. Python 3 required; no pip modules.
-4. Use Chrome or Edge at http://127.0.0.1:47621/.
-5. The launcher uses E:\ICLOUD\iCloudDrive\Anki. Only loopback connections are allowed.
+What is new: all updated clients can recognize a peer's immutable archive for the exact current local journal checkpoint. SHA-256, publisher identity, embedded manifest/events, card content/reviews and SQLite quick_check/card count must pass. No archive is imported or overwritten by discovery. Only when the original is verified older and the independent version is verified current does the dashboard show UP TO DATE for that version. The original named file may remain older; expand the status for details. This is local verification, not confirmation of delivery to every device.
 
-IPHONE / IPAD
-1. Native Swift bridge changes require one new IPA build via your existing
-   GitHub Actions workflow. Install OVER the previous app using the same bundle ID.
-2. Connect iCloud Drive / Anki inside the app.
-3. The signed update ZIP can be copied to AnkiSync-Updates AFTER the new IPA
-   is installed; it contains the same journal-compatible HTML.
-4. Old IPAs cannot access AnkiSync-Changes. HTML updates alone are insufficient.
+Desktop publisher authority, transfer receipts, original names, journal writes and compact format unchanged. Discovery is read-only on desktop; mobile pilot writes its separate versions as before. Keep all existing hidden publisher state files and launchers. Do not delete any archives. Independent version generation remains opt-in for one deck per mobile device, max 5 files/device/deck, 64 MiB, foreground only. The minimum gap between writes in a running mobile session is now 120 seconds rather than 600; stable journal still requires 90 seconds. Countdown reflects the current session schedule, not iCloud delivery time. No automatic cleanup or guaranteed single writer. If no matching version is visible or verification fails, archive may stay pending. No paid developer membership, Firebase or new server.
 
-FIRST TEST
-1. Import the SAME disposable .apkg on both devices.
-2. On iPad, tap Enable iCloud Changes. Confirm the one-time initialization.
-3. Wait for the AnkiSync-Changes folder to finish appearing on iPhone.
-4. On iPhone, tap Enable iCloud Changes. It will refuse if starting cards or
-   review schedules differ. Never approve a replacement merely to silence an error.
-5. Rate one test card Good on iPad. Wait for iCloud to deliver the small event.
-6. Tap Check Changes on iPhone (or leave it open; it checks every ~15 seconds).
-7. Verify EXACT dueAt and lastReviewedAt. Then edit a DIFFERENT card on iPhone
-   and verify it arrives on iPad.
-8. Finally, try editing the same field differently on both: it must STOP with
-   a conflict and keep both versions. Export backups for manual resolution.
+Test with both desktops closed, no edits. Use existing 150-card ILD checkpoint and mobile archive versions. After iCloud has delivered files, open updated iPad/iPhone first, then test desktop. Expand status: if named original remains older, expect Independent archive matches local journal, and details identify this device or another device. If named original has already caught up, green original verification is also correct but does not exercise independent discovery. Do not import version files as decks. No further card edits needed for initial discovery test. Keep the existing test cards and backups.
 
-IMPORTANT LIMITS
-- iCloud Drive transfer latency is not guaranteed, even with both apps open.
-- No continuous background execution on suspended iPhone/iPad apps.
-- Conflicting same-field edits and initially mismatched decks are HELD, not
-  automatically reconciled. Both versions remain untouched for review.
-- The FIRST manifest is a full snapshot, not a repeated .apkg export;
-  subsequent files record changed card fields only.
-- Card order changes and whole-deck tile deletion are not synchronized in v1.
-- This pilot has JavaScript simulation and Windows local API tests; a real
-  iPhone/iPad native build and iCloud transfer still need verification.
-- No new cloud database, login, or Firebase is used.
-- Leave AnkiSync-Changes alone; records are immutable. Do not move or rename it.
+Validation: actual uploaded 150-card iPad and iPhone ILD archives passed discovery using both desktop HTML scripts and mobile script with mocked I/O; peer reuse avoided mobile build/write; missing event, invalid digest and mismatched publisher rejected; no matching archive returns no verification. Windows/Mac Python endpoints tested under Linux against actual uploaded archive bytes (authorization, path traversal, symlinks, corrupt checksums). JS syntax checks, Python compile, Swift syntax parse and ZIP integrity passed. No Xcode build, real iCloud, native iOS or desktop OS integration test was performed. No changes made to live files.
 
-This source retains the original GitHub Actions build configuration.
+iOS 2.5.0 build 10: replace only AnkiSync/Info.plist, AnkiSync/Resources/AnkiSync.html and AnkiSync/Sources/AnkiSyncViewController.swift in your existing GitHub repository. Use the existing IPA workflow and sideload over the existing app with the same bundle/signing identity. Back up first; do not uninstall. Test iPad first. If a cached signed interface still loads, restore the bundled UI with the existing native three-finger double-tap gesture after saving edits. Do not apply an older signed HTML update.
